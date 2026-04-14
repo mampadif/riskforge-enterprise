@@ -664,17 +664,17 @@ def normalize_for_dedupe(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-def embedding_similarity(texts: List[str]) -> List[List[float]]:
+def embedding_similarity(texts: List[str]) -> Optional[np.ndarray]:
     if not EMBEDDING_AVAILABLE or len(texts) < 2:
-        return []
+        return None
     model = get_embedding_model()
     if model is None:
-        return []
+        return None
     try:
         embeddings = model.encode(texts)
         return cosine_similarity(embeddings)
     except Exception:
-        return []
+        return None
 
 def detect_semantic_duplicates(df: pd.DataFrame, threshold: float = 0.85) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df.empty:
@@ -686,13 +686,14 @@ def detect_semantic_duplicates(df: pd.DataFrame, threshold: float = 0.85) -> Tup
     keep_indices = []
     duplicate_map = []
     statements = df["_normalized"].tolist()
-    sim_matrix = embedding_similarity(statements) if EMBEDDING_AVAILABLE and len(statements) > 1 else []
+    sim_matrix = embedding_similarity(statements) if EMBEDDING_AVAILABLE and len(statements) > 1 else None
+    
     for i, stmt in enumerate(statements):
         is_duplicate = False
         for j in keep_indices:
             if j >= len(statements):
                 continue
-            if sim_matrix and i < len(sim_matrix) and j < len(sim_matrix[i]):
+            if sim_matrix is not None and i < sim_matrix.shape[0] and j < sim_matrix.shape[1]:
                 similarity = sim_matrix[i][j]
             else:
                 similarity = fuzz.ratio(stmt, statements[j]) / 100.0
