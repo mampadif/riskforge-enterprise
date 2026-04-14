@@ -132,12 +132,14 @@ def detect_register_title(df: pd.DataFrame) -> Optional[str]:
     for col in df.columns:
         sample = df[col].astype(str).head(10)
         for val in sample:
-            if "risk monitoring" in val.lower():
-                return val.strip()
-            if "risk register" in val.lower() and len(val) < 60:
-                return val.strip()
-            if "quarter" in val.lower() and "risk" in val.lower():
-                return val.strip()
+            # Convert to string safely before calling .lower()
+            val_str = str(val).strip()
+            if "risk monitoring" in val_str.lower():
+                return val_str
+            if "risk register" in val_str.lower() and len(val_str) < 60:
+                return val_str
+            if "quarter" in val_str.lower() and "risk" in val_str.lower():
+                return val_str
     return None
 
 # =============================================================================
