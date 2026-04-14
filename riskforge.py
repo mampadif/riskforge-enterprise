@@ -32,7 +32,7 @@ except ImportError:
     EMBEDDING_AVAILABLE = False
 
 # =============================================================================
-# CONFIGURATION & SECRETS
+# CONFIGURATION
 # =============================================================================
 st.set_page_config(page_title="RiskForge Enterprise", page_icon="🛡️", layout="wide")
 
@@ -136,13 +136,8 @@ def cached_ai_summary(snapshot_json: str, company: str) -> str:
     return ai_polish_narrative(snapshot, company)
 
 # =============================================================================
-# UTILITY FUNCTIONS
+# HELPER FUNCTIONS
 # =============================================================================
-def normalize_text(text: Any) -> str:
-    if pd.isna(text):
-        return ""
-    return str(text).strip().lower()
-
 def clean_division_name(filename: str) -> str:
     name = re.sub(r"\.xlsx$|\.xls$|\.csv$", "", filename, flags=re.IGNORECASE)
     name = re.sub(r"^copy of\s+", "", name, flags=re.IGNORECASE)
@@ -150,69 +145,20 @@ def clean_division_name(filename: str) -> str:
     name = re.sub(r"\s+", " ", name)
     return name.title() if name else "Unknown Division"
 
-def make_unique_columns(columns) -> list[str]:
-    seen: dict[str, int] = {}
-    unique_cols: list[str] = []
-    for i, col in enumerate(columns):
-        base = str(col).strip() if col is not None else ""
-        if not base or base.lower() == "nan":
-            base = f"col_{i}"
-        count = seen.get(base, 0) + 1
-        seen[base] = count
-        if count == 1:
-            unique_cols.append(base)
-        else:
-            unique_cols.append(f"{base}__{count}")
-    return unique_cols
-
-def detect_header_row(df: pd.DataFrame, max_rows: int = 10) -> Tuple[int, float]:
-    best_row = 0
-    best_score = 0.0
-    for i in range(min(max_rows, len(df))):
-        row_vals = [normalize_text(x) for x in df.iloc[i].fillna("").tolist()]
-        score = 0
-        risk_keywords = ["risk", "statement", "description", "owner", "score", "category", "division", "impact", "likelihood"]
-        for keyword in risk_keywords:
-            if any(keyword in val for val in row_vals):
-                score += 2
-        if score > best_score:
-            best_score = score
-            best_row = i
-    return best_row, best_score
-
-# =============================================================================
-# IMPROVED RISK SCORE PARSER (handles Excel errors)
-# =============================================================================
 def parse_risk_score(val: Any) -> Optional[float]:
-    """Parse risk scores from various formats, including Excel error values."""
     if pd.isna(val):
         return None
-    
     s = str(val).strip().lower()
-    
-    # Handle Excel error values
-    excel_errors = ["#n/a", "#value!", "#ref!", "#name?", "#num!", "#null!", "none", "nan", ""]
-    if s in excel_errors:
+    if s in ["#n/a", "#value!", "#ref!", "#name?", "#num!", "#null!", "none", "nan", ""]:
         return None
-    
-    # Handle formula strings that start with =
-    if s.startswith("="):
-        return None
-    
-    # Text to score mapping
     text_map = {
         "low": 5.0, "medium": 10.0, "moderate": 10.0, "high": 15.0,
         "very high": 20.0, "critical": 25.0, "extreme": 25.0,
         "minor": 5.0, "major": 15.0, "severe": 20.0,
         "almost certain": 20.0, "likely": 15.0, "possible": 10.0, "unlikely": 5.0, "rare": 5.0,
     }
-    
-    # Check exact match or partial match
-    for key, value in text_map.items():
-        if key in s:
-            return value
-    
-    # Extract numbers
+    if s in text_map:
+        return text_map[s]
     match = re.search(r'(\d+(?:\.\d+)?)', s)
     if match:
         num = float(match.group(1))
@@ -222,503 +168,263 @@ def parse_risk_score(val: Any) -> Optional[float]:
             return num * 2.5
         if 1 <= num <= 25:
             return num
-    
     return None
 
 # =============================================================================
-# EXCEL PARSER WITH OPENPYXL (data_only=True to get calculated values)
+# DIRECT PARSER FOR HR RISK REGISTER
 # =============================================================================
-def worksheet_to_dataframe(ws) -> pd.DataFrame:
-    """Convert openpyxl worksheet to pandas DataFrame."""
-    data = list(ws.values)
-    if not data:
-        return pd.DataFrame()
-    return pd.DataFrame(data)
-
-def parse_excel_file_bytes(file_bytes: bytes, file_name: str) -> Tuple[pd.DataFrame, Dict]:
-    """Parse Excel file using openpyxl with data_only=True to get calculated formula results."""
-    all_sheets_data = []
-    debug_info = {"sheets_processed": 0, "rows_scanned": 0, "sheets": [], "formula_cells_encountered": 0}
-
+def parse_hr_risk_register(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    """Direct parser for the HR Risk Register format."""
     try:
         wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
-
-        for sheet_name in wb.sheetnames:
-            sheet_info = {"sheet_name": sheet_name, "rows_scanned": 0, "rows_extracted": 0}
-            ws = wb[sheet_name]
-
-            df_raw = worksheet_to_dataframe(ws)
-            if df_raw.empty or df_raw.shape[1] < 2:
-                continue
-
-            header_row, _ = detect_header_row(df_raw)
-            sheet_info["header_row_detected"] = header_row
-
-            if header_row > 0:
-                raw_headers = [
-                    str(x).strip() if not pd.isna(x) else f"col_{i}"
-                    for i, x in enumerate(df_raw.iloc[header_row].tolist())
-                ]
-                headers = make_unique_columns(raw_headers)
-                df = df_raw.iloc[header_row + 1:].reset_index(drop=True)
-                df.columns = headers
-            else:
-                df = df_raw.copy()
-                df.columns = make_unique_columns([f"col_{i}" for i in range(df.shape[1])])
-
-            df = df.dropna(how="all").reset_index(drop=True)
-            if df.empty or len(df) < 2:
-                continue
-
-            if not df.columns.is_unique:
-                df.columns = make_unique_columns(df.columns)
-
-            sheet_info["rows_scanned"] = len(df)
-            sheet_info["rows_extracted"] = len(df)
-            all_sheets_data.append(df)
-            debug_info["sheets_processed"] += 1
-            debug_info["rows_scanned"] += len(df)
-            debug_info["sheets"].append(sheet_info)
-
-    except Exception as e:
-        st.warning(f"Error parsing {file_name}: {e}")
-        return pd.DataFrame(), debug_info
-
-    if not all_sheets_data:
-        return pd.DataFrame(), debug_info
-
-    try:
-        combined = pd.concat(all_sheets_data, ignore_index=True, sort=False)
-        debug_info["total_rows_combined"] = len(combined)
-    except Exception as e:
-        st.error(f"Sheet consolidation failed for {file_name}: {e}")
-        return pd.DataFrame(), debug_info
-
-    return combined, debug_info
-
-# =============================================================================
-# TAXONOMY FILTER & RISK VALIDATION
-# =============================================================================
-NON_RISK_PATTERNS = [
-    "opportunity response", "treatment strategy", "risk response", "exploit",
-    "enhance", "share", "accept", "avoid", "transfer", "mitigate",
-]
-
-INVALID_RISK_PATTERNS = [
-    "opportunity response", "risk monitoring", "risk register", "risk category",
-    "treatment strategy", "response strategy", "quarter", "worksheet", "header",
-    "instruction", "approved by", "reviewed by", "signed off", "confidential", "footer",
-    "link to objective", "risk no", "division/ dept", "human resources risk register",
-]
-
-def looks_like_taxonomy_row(text: str) -> bool:
-    if not text or not isinstance(text, str):
-        return True
-    t = text.lower().strip()
-    for pattern in NON_RISK_PATTERNS:
-        if t.startswith(pattern) or pattern in t.split()[:3]:
-            return True
-    words = t.split()
-    if len(words) < 8:
-        for word in words[:3]:
-            if word in NON_RISK_PATTERNS:
-                return True
-    return False
-
-def is_invalid_risk_header(text: str) -> bool:
-    if not text or not isinstance(text, str):
-        return True
-    t = text.lower().strip()
-    if t in INVALID_RISK_PATTERNS:
-        return True
-    if len(t.split()) <= 4:
-        for h in INVALID_RISK_PATTERNS:
-            if h in t:
-                return True
-    return False
-
-def is_metadata_risk(text: str) -> bool:
-    """Check if a risk statement is actually metadata/header."""
-    if not text or not isinstance(text, str):
-        return True
-    text_lower = text.lower().strip()
-    if len(text_lower) < 10:
-        return True
-    metadata_phrases = [
-        "bitri risk monitoring tool", "period of assessment", "department/ unit",
-        "description of control", "overall effectiveness", "control categorisation",
-        "overall status of action plan", "new and old risks form", "processed by",
-        "approved by", "recommended by", "current controls", "action plan",
-        "residual risk", "risk strategy", "inherent risk", "risk owner",
-        "impact rating", "likelihood rating", "root cause", "consequences",
-        "start date", "target completion date", "responsible person",
-    ]
-    for phrase in metadata_phrases:
-        if phrase in text_lower:
-            return True
-    return False
-
-def is_valid_risk_statement(text: str) -> bool:
-    """Determine if a row represents a genuine risk."""
-    if not isinstance(text, str):
-        return False
-
-    text_clean = text.strip()
-    if len(text_clean) < 12:
-        return False
-
-    if is_metadata_risk(text_clean):
-        return False
-
-    if looks_like_taxonomy_row(text_clean):
-        return False
-
-    if is_invalid_risk_header(text_clean):
-        return False
-
-    text_lower = text_clean.lower()
-
-    # Block obvious non-risk phrases
-    blocked_patterns = [
-        "approved by", "reviewed by", "submitted by", "signed off",
-        "page ", "confidential", "header", "footer", "signature",
-        "current controls", "action plan", "treatment plan",
-        "opportunity response", "treatment strategy"
-    ]
-    if any(pattern in text_lower for pattern in blocked_patterns):
-        return False
-
-    # Reject very short labels / headings
-    if len(text_clean.split()) <= 2:
-        return False
-
-    # Accept any reasonably long sentence (>=5 words) as a risk statement
-    if len(text_clean.split()) >= 5:
-        return True
-
-    return False
-
-# =============================================================================
-# DIVISION DETECTION
-# =============================================================================
-def detect_division_with_confidence(df: pd.DataFrame, file_name: str, row: pd.Series = None) -> Tuple[str, float, str]:
-    confidence = 0.0
-    source = "fallback"
-    division = "Unassigned"
-    
-    if row is not None:
-        for col in df.columns:
-            col_lower = normalize_text(col)
-            if any(term in col_lower for term in ["division", "department", "directorate", "unit", "business unit"]):
-                val = str(row[col]) if pd.notna(row[col]) else ""
-                if val and val.lower() not in ["not assigned", "unknown", "n/a", ""]:
-                    division = val
-                    confidence = 0.95
-                    source = "dedicated column"
-                    return division, confidence, source
-    
-    cleaned = clean_division_name(file_name)
-    if cleaned and cleaned.lower() not in ["register", "risk register", "risk"]:
-        division = cleaned
-        confidence = 0.70
-        source = "filename"
-        return division, confidence, source
-    
-    return division, confidence, source
-
-# =============================================================================
-# INTELLIGENT COLUMN DETECTION (Fuzzy Matching)
-# =============================================================================
-def find_best_column(df: pd.DataFrame, target_keywords: List[str], threshold: int = 60) -> Optional[str]:
-    if df.empty:
-        return None
-    col_names = [str(c).strip() for c in df.columns]
-    best_match = None
-    best_score = 0
-    for col in col_names:
-        for kw in target_keywords:
-            score = fuzz.partial_ratio(col.lower(), kw.lower())
-            if score > best_score:
-                best_score = score
-                best_match = col
-    if best_score >= threshold:
-        return best_match
-    return None
-
-def detect_risk_columns(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    field_keywords = {
-        "risk_statement": ["risk statement", "risk description", "description", "statement", "risk", "risk details", "risk event"],
-        "risk_name": ["risk name", "risk title", "name", "title"],
-        "residual_score": ["residual score", "residual risk", "current score", "score", "rating", "risk level", "residual rating"],
-        "owner": ["risk owner", "owner", "responsible", "responsible party", "accountable"],
-        "category": ["risk category", "category", "type", "classification"],
-        "impact": ["impact", "impact rating", "severity", "consequence"],
-        "likelihood": ["likelihood", "likelihood rating", "probability", "frequency"],
-        "division": ["division", "department", "directorate", "unit", "business unit", "section"],
-        "status": ["status", "risk status", "current status", "state"],
-        "due_date": ["due date", "target date", "completion date", "deadline", "action date"],
-        "control_effectiveness": ["control effectiveness", "effectiveness", "control rating", "control strength"]
-    }
-    mapping = {}
-    for field, keywords in field_keywords.items():
-        mapping[field] = find_best_column(df, keywords, threshold=55)
-    return mapping
-
-# =============================================================================
-# TABULAR RISK EXTRACTOR (with formula handling)
-# =============================================================================
-def extract_risk_from_dataframe(df: pd.DataFrame, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    if df.empty:
-        return pd.DataFrame(), {}
-    
-    detected_title = detect_register_title(df)
-    if detected_title:
-        st.session_state.report_title = detected_title
-    
-    mapping = detect_risk_columns(df)
-    risk_col = mapping.get("risk_statement")
-    
-    if risk_col is None:
-        for col in df.columns:
-            sample = df[col].astype(str).dropna()
-            if len(sample) > 0 and any(len(str(x)) > 15 for x in sample):
-                risk_col = col
+        
+        if "consolidated risk register" not in wb.sheetnames:
+            return pd.DataFrame(), {"error": "Sheet 'consolidated risk register' not found"}
+        
+        ws = wb["consolidated risk register"]
+        
+        # Find header row
+        header_row_idx = None
+        risk_desc_col = None
+        risk_name_col = None
+        impact_col = None
+        likelihood_col = None
+        owner_col = None
+        
+        for row_idx in range(1, min(10, ws.max_row + 1)):
+            for col_idx in range(1, min(20, ws.max_column + 1)):
+                val = ws.cell(row=row_idx, column=col_idx).value
+                if val and "risk description" in str(val).lower():
+                    header_row_idx = row_idx
+                    break
+            if header_row_idx:
                 break
-    if risk_col is None:
-        risk_col = df.columns[0] if len(df.columns) > 0 else None
-    if risk_col is None:
-        return pd.DataFrame(), {"error": "No risk column found"}
-    
-    mapping["risk_statement"] = risk_col
-    
-    debug_info = {
-        "mapping": {k: str(v) for k, v in mapping.items() if v},
-        "rows_processed": 0,
-        "rows_valid": 0,
-        "rows_filtered_short": 0,
-        "rows_filtered_taxonomy": 0,
-        "rows_filtered_metadata": 0,
-        "rows_missing_formula_values": 0,
-        "formula_cells_detected": 0,
-    }
+        
+        if header_row_idx is None:
+            return pd.DataFrame(), {"error": "Could not find header row"}
+        
+        # Find column indices
+        for col_idx in range(1, min(30, ws.max_column + 1)):
+            val = ws.cell(row=header_row_idx, column=col_idx).value
+            if val:
+                val_lower = str(val).lower()
+                if "risk description" in val_lower:
+                    risk_desc_col = col_idx
+                elif "risk name" in val_lower or "name" in val_lower:
+                    risk_name_col = col_idx
+                elif "impact" in val_lower and "likelihood" not in val_lower:
+                    impact_col = col_idx
+                elif "likelihood" in val_lower:
+                    likelihood_col = col_idx
+                elif "owner" in val_lower:
+                    owner_col = col_idx
+        
+        if risk_desc_col is None:
+            return pd.DataFrame(), {"error": "Risk description column not found"}
+        
+        # Extract risks
+        risks = []
+        for row_idx in range(header_row_idx + 1, min(header_row_idx + 50, ws.max_row + 1)):
+            risk_text = ws.cell(row=row_idx, column=risk_desc_col).value
+            if not risk_text:
+                continue
+            risk_text = str(risk_text).strip()
+            
+            if len(risk_text) < 15:
+                continue
+            if risk_text.lower() in ["risk description", "nan", "none", ""]:
+                continue
+            
+            # Get risk name
+            risk_name = risk_text[:50]
+            if risk_name_col:
+                name_val = ws.cell(row=row_idx, column=risk_name_col).value
+                if name_val and str(name_val).strip() and len(str(name_val).strip()) > 3:
+                    risk_name = str(name_val).strip()[:80]
+            
+            # Get impact and likelihood
+            impact_score = None
+            if impact_col:
+                impact_val = ws.cell(row=row_idx, column=impact_col).value
+                impact_score = parse_risk_score(impact_val)
+            
+            likelihood_score = None
+            if likelihood_col:
+                likelihood_val = ws.cell(row=row_idx, column=likelihood_col).value
+                likelihood_score = parse_risk_score(likelihood_val)
+            
+            # Calculate residual
+            residual = default_residual
+            if impact_score and likelihood_score:
+                residual = min(25, max(1, (impact_score * likelihood_score) / 5))
+            elif impact_score:
+                residual = min(25, impact_score * 5)
+            elif likelihood_score:
+                residual = min(25, likelihood_score * 5)
+            
+            # Get owner
+            owner = "Not assigned"
+            if owner_col:
+                owner_val = ws.cell(row=row_idx, column=owner_col).value
+                if owner_val and str(owner_val).strip() and str(owner_val).strip() != "nan":
+                    owner = str(owner_val).strip()
+            
+            # Categorize based on risk text
+            category = "Uncategorised"
+            risk_lower = risk_text.lower()
+            if any(term in risk_lower for term in ["hr", "human resources", "employee", "staff", "talent"]):
+                category = "People/HR"
+            elif any(term in risk_lower for term in ["compliance", "regulation", "labour law", "employment act"]):
+                category = "Compliance/Legal"
+            elif any(term in risk_lower for term in ["financial", "budget"]):
+                category = "Financial"
+            elif any(term in risk_lower for term in ["operational", "process"]):
+                category = "Operational"
+            elif any(term in risk_lower for term in ["strategic"]):
+                category = "Strategic"
+            elif any(term in risk_lower for term in ["cyber", "security", "data"]):
+                category = "ICT/Cyber"
+            
+            risks.append({
+                "division": "Human Resources",
+                "division_confidence": 0.95,
+                "division_source": "direct_parse",
+                "risk_name": risk_name,
+                "risk_statement": risk_text[:500],
+                "category": category,
+                "residual_score": residual,
+                "inherent_score": min(25, residual + 3),
+                "owner": owner,
+                "status": "Active",
+                "due_date": None,
+                "control_effectiveness": "Not rated",
+                "impact_score": impact_score,
+                "likelihood_score": likelihood_score,
+            })
+        
+        if risks:
+            return pd.DataFrame(risks), {"extracted": len(risks), "method": "direct_hr_parser"}
+        else:
+            return pd.DataFrame(), {"error": "No risks found in consolidated register"}
+            
+    except Exception as e:
+        return pd.DataFrame(), {"error": f"HR parser failed: {str(e)}"}
 
-    risks = []
-    seen_statements = set()
+# =============================================================================
+# GEMINI EXTRACTION (FALLBACK)
+# =============================================================================
+def gemini_extract_risks(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    if not GEMINI_AVAILABLE:
+        return pd.DataFrame(), {"error": "Gemini not available"}
     
-    for _, row in df.iterrows():
-        debug_info["rows_processed"] += 1
-        risk_text = str(row[risk_col]) if pd.notna(row[risk_col]) else ""
+    try:
+        xls = pd.ExcelFile(io.BytesIO(file_bytes))
+        all_content = []
         
-        # Check for formula strings
-        if risk_text.startswith("="):
-            debug_info["formula_cells_detected"] += 1
-            continue
+        for sheet in xls.sheet_names:
+            if sheet.lower() in ["boundaries", "impact", "likelihood", "effectiveness", "risk matrix"]:
+                continue
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None)
+            sheet_str = f"\n[SHEET: {sheet}]\n"
+            for i in range(min(50, df.shape[0])):
+                row_vals = []
+                for j in range(min(20, df.shape[1])):
+                    val = df.iat[i, j]
+                    if pd.notna(val) and str(val).strip():
+                        row_vals.append(str(val).strip())
+                if row_vals:
+                    sheet_str += f"Row {i+1}: {' | '.join(row_vals)}\n"
+            all_content.append(sheet_str)
         
-        if len(risk_text) < 12 or risk_text == "nan":
-            debug_info["rows_filtered_short"] += 1
-            continue
+        content = "\n".join(all_content)
+        if len(content) > 8000:
+            content = content[:8000]
         
-        if is_metadata_risk(risk_text):
-            debug_info["rows_filtered_metadata"] += 1
-            continue
-        
-        if not is_valid_risk_statement(risk_text):
-            debug_info["rows_filtered_taxonomy"] += 1
-            continue
-        
-        if risk_text in seen_statements:
-            continue
-        seen_statements.add(risk_text)
-        
-        # Extract risk name
-        risk_name = risk_text[:50]
-        if mapping.get("risk_name") and pd.notna(row[mapping["risk_name"]]):
-            name_val = str(row[mapping["risk_name"]]).strip()
-            if name_val and name_val != "nan" and len(name_val) > 3:
-                risk_name = name_val[:80]
-        
-        # Extract scores - handle formula cells gracefully
-        residual_score = None
-        if mapping.get("residual_score") and pd.notna(row[mapping["residual_score"]]):
-            residual_score = parse_risk_score(row[mapping["residual_score"]])
-        
-        impact_score = None
-        if mapping.get("impact") and pd.notna(row[mapping["impact"]]):
-            impact_score = parse_risk_score(row[mapping["impact"]])
-        
-        likelihood_score = None
-        if mapping.get("likelihood") and pd.notna(row[mapping["likelihood"]]):
-            likelihood_score = parse_risk_score(row[mapping["likelihood"]])
-        
-        # If all scores are missing (likely due to formulas without cached values), count it
-        if residual_score is None and impact_score is None and likelihood_score is None:
-            debug_info["rows_missing_formula_values"] += 1
-        
-        # Calculate residual
-        if residual_score is None and impact_score is not None and likelihood_score is not None:
-            residual_score = min(25, max(1, (impact_score * likelihood_score) / 5))
-        if residual_score is None:
-            residual_score = default_residual
-        
-        # Extract owner
-        owner = "Not assigned"
-        if mapping.get("owner") and pd.notna(row[mapping["owner"]]):
-            owner_val = str(row[mapping["owner"]]).strip()
-            if owner_val and owner_val != "nan":
-                owner = owner_val
-        
-        # Extract category
-        category = None
-        if mapping.get("category") and pd.notna(row[mapping["category"]]):
-            category = str(row[mapping["category"]]).strip()
-        if not category or category == "nan":
-            category = ai_infer_category(risk_text) if GEMINI_AVAILABLE else "Uncategorised"
-        
-        # Extract division
-        division, div_confidence, div_source = detect_division_with_confidence(df, file_name, row)
-        if mapping.get("division") and pd.notna(row[mapping["division"]]):
-            division = str(row[mapping["division"]]).strip()
-            div_confidence = 0.9
-            div_source = "detected_column"
-        
-        # Extract status
-        status = "Not specified"
-        if mapping.get("status") and pd.notna(row[mapping["status"]]):
-            status = str(row[mapping["status"]]).strip()
-        
-        # Extract due date
-        due_date = None
-        if mapping.get("due_date") and pd.notna(row[mapping["due_date"]]):
-            try:
-                due_date = pd.to_datetime(row[mapping["due_date"]]).date()
-            except:
-                pass
-        
-        # Extract control effectiveness
-        control_effectiveness = "Not rated"
-        if mapping.get("control_effectiveness") and pd.notna(row[mapping["control_effectiveness"]]):
-            control_effectiveness = str(row[mapping["control_effectiveness"]]).strip()
-        
-        risks.append({
-            "division": division,
-            "division_confidence": div_confidence,
-            "division_source": div_source,
-            "risk_name": risk_name,
-            "risk_statement": risk_text[:500],
-            "category": category,
-            "residual_score": min(25, max(1, residual_score)),
-            "inherent_score": min(25, residual_score + 3),
-            "owner": owner,
-            "status": status,
-            "due_date": due_date,
-            "control_effectiveness": control_effectiveness,
-            "impact_score": impact_score,
-            "likelihood_score": likelihood_score,
-        })
-        debug_info["rows_valid"] += 1
-    
-    return pd.DataFrame(risks), debug_info
+        prompt = f"""
+You are a risk extraction engine. Extract ALL risks as a JSON list.
+Each risk must have: risk_statement, risk_name, owner, residual_score (1-25).
+Do NOT extract metadata.
 
-def detect_register_title(df: pd.DataFrame) -> Optional[str]:
-    if df.empty:
-        return None
-    for col in df.columns:
-        sample = df[col].astype(str).head(10)
-        for val in sample:
-            val_str = str(val).strip()
-            if "risk monitoring" in val_str.lower():
-                return val_str
-            if "risk register" in val_str.lower() and len(val_str) < 60:
-                return val_str
-            if "quarter" in val_str.lower() and "risk" in val_str.lower():
-                return val_str
-    return None
+Return ONLY valid JSON.
 
-def assess_parser_confidence(mapping: Dict[str, str], has_impact_likelihood: bool) -> Tuple[float, str, List[str]]:
-    required_risk = ["risk_statement"]
-    required_score = ["residual_score"]
-    found_risk = sum(1 for f in required_risk if f in mapping)
-    found_score = sum(1 for f in required_score if f in mapping)
-    base = (found_risk / len(required_risk)) * 50
-    if found_score > 0:
-        score = base + 50
-    elif has_impact_likelihood:
-        score = base + 40
-    else:
-        score = base + 10
-    score = min(100, max(0, score))
-    level = "High" if score >= 80 else "Medium" if score >= 50 else "Low"
-    inferred = [f"{k} -> {v}" for k, v in mapping.items() if v]
-    return score, level, inferred
+Content:
+{content}
+"""
+        response = ai_model.generate_content(prompt)
+        text = response.text.strip()
+        
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        
+        data = json.loads(text)
+        risks = data.get("risks", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        
+        rows = []
+        for r in risks:
+            risk_statement = r.get("risk_statement", "")
+            if not risk_statement or len(risk_statement) < 15:
+                continue
+            rows.append({
+                "division": clean_division_name(file_name),
+                "division_confidence": 0.8,
+                "division_source": "gemini",
+                "risk_name": r.get("risk_name", risk_statement[:50]),
+                "risk_statement": risk_statement[:500],
+                "category": "Uncategorised",
+                "residual_score": min(25, max(1, int(r.get("residual_score", default_residual)))),
+                "inherent_score": min(25, int(r.get("residual_score", default_residual)) + 3),
+                "owner": r.get("owner", "Not assigned"),
+                "status": "Active",
+                "due_date": None,
+                "control_effectiveness": "Not rated",
+                "impact_score": r.get("impact_score"),
+                "likelihood_score": r.get("likelihood_score"),
+            })
+        
+        if rows:
+            return pd.DataFrame(rows), {"extracted": len(rows), "method": "gemini"}
+        return pd.DataFrame(), {"error": "No risks found"}
+        
+    except Exception as e:
+        return pd.DataFrame(), {"error": f"Gemini failed: {str(e)}"}
 
 # =============================================================================
 # MAIN PARSER DISPATCHER
 # =============================================================================
 def parse_uploaded_file_bytes(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    # Use openpyxl-based parser for Excel files
-    if file_name.endswith('.csv'):
-        try:
-            df = pd.read_csv(io.BytesIO(file_bytes))
-            return extract_risk_from_dataframe(df, file_name, default_residual)
-        except Exception as e:
-            return pd.DataFrame(), {"error": str(e)}
-    else:
-        df, debug_sheets = parse_excel_file_bytes(file_bytes, file_name)
-        if df.empty:
-            return pd.DataFrame(), debug_sheets
-        return extract_risk_from_dataframe(df, file_name, default_residual)
+    # Priority 1: Direct HR parser
+    df, debug = parse_hr_risk_register(file_bytes, file_name, default_residual)
+    if not df.empty:
+        return df, debug
+    
+    # Priority 2: Gemini extraction
+    if GEMINI_AVAILABLE and st.session_state.force_gemini:
+        df, debug = gemini_extract_risks(file_bytes, file_name, default_residual)
+        if not df.empty:
+            return df, debug
+    
+    return pd.DataFrame(), {"error": "No risks could be extracted"}
 
 def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[pd.DataFrame, List[Dict]]:
     all_risks = []
     all_debug = []
-    total_rows_scanned = 0
-    total_rows_extracted = 0
-    total_filtered_taxonomy = 0
-    total_filtered_header = 0
-    total_filtered_short = 0
-    total_filtered_metadata = 0
-    total_missing_formula_values = 0
-    
     for file in uploaded_files:
         df, debug = cached_parse_file(file.getvalue(), file.name, default_residual)
         all_debug.append(debug)
         if not df.empty:
             all_risks.append(df)
-            total_rows_extracted += len(df)
-            total_filtered_taxonomy += debug.get("rows_filtered_taxonomy", 0)
-            total_filtered_header += debug.get("rows_filtered_header", 0)
-            total_filtered_short += debug.get("rows_filtered_short", 0)
-            total_filtered_metadata += debug.get("rows_filtered_metadata", 0)
-            total_missing_formula_values += debug.get("rows_missing_formula_values", 0)
-    
     if not all_risks:
         return pd.DataFrame(), all_debug
-    
     df_all = pd.concat(all_risks, ignore_index=True)
     df_all, _ = detect_semantic_duplicates(df_all, threshold=0.85)
-    unique_risk_count = df_all["risk_statement"].nunique()
     df_all["residual_level"] = df_all["residual_score"].apply(lambda x: "Critical" if x >= 20 else "High" if x >= 12 else "Medium" if x >= 6 else "Low")
     if tier == "free":
         df_all = df_all.head(10)
-    
-    audit_summary = {
-        "total_files": len(uploaded_files),
-        "total_rows_scanned": sum(d.get("rows_scanned", 0) for d in all_debug),
-        "total_rows_extracted": total_rows_extracted,
-        "total_filtered_taxonomy": total_filtered_taxonomy,
-        "total_filtered_header": total_filtered_header,
-        "total_filtered_short": total_filtered_short,
-        "total_filtered_metadata": total_filtered_metadata,
-        "total_missing_formula_values": total_missing_formula_values,
-        "unique_risks": unique_risk_count,
-        "division_confidence": "Mixed"
-    }
-    st.session_state.parser_audit = audit_summary
-    
-    # Show warning if formula values were missing
-    if total_missing_formula_values > 0:
-        st.warning(f"⚠️ {total_missing_formula_values} risk rows had formula cells without cached values. Default scores were applied. For best results, open the Excel file, save it (which calculates formulas), then re-upload.")
-    
+    st.session_state.parser_audit = {"total_files": len(uploaded_files), "total_risks": len(df_all)}
     return df_all, all_debug
 
 # =============================================================================
@@ -741,7 +447,7 @@ def embedding_similarity(texts: List[str]) -> Optional[np.ndarray]:
     try:
         embeddings = model.encode(texts)
         return cosine_similarity(embeddings)
-    except Exception:
+    except:
         return None
 
 def detect_semantic_duplicates(df: pd.DataFrame, threshold: float = 0.85) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -755,7 +461,6 @@ def detect_semantic_duplicates(df: pd.DataFrame, threshold: float = 0.85) -> Tup
     duplicate_map = []
     statements = df["_normalized"].tolist()
     sim_matrix = embedding_similarity(statements) if EMBEDDING_AVAILABLE and len(statements) > 1 else None
-    
     for i, stmt in enumerate(statements):
         is_duplicate = False
         for j in keep_indices:
@@ -777,16 +482,14 @@ def detect_semantic_duplicates(df: pd.DataFrame, threshold: float = 0.85) -> Tup
     return deduped, duplicates_df
 
 # =============================================================================
-# AI FUNCTIONS (for category inference, narrative, etc.)
+# AI FUNCTIONS
 # =============================================================================
 def ai_infer_category(statement: str, fallback: str = "Uncategorised") -> str:
     categories = ["Strategic", "Financial", "Operational", "ICT/Cyber", "Compliance/Legal", "People/HR", "Health/Safety", "Reputational", "Environmental"]
     if not GEMINI_AVAILABLE or len(statement) < 20:
         return fallback
     try:
-        prompt = f"""Classify this risk into exactly one of these categories: {', '.join(categories)}.
-Return ONLY the category name, nothing else.
-Risk: {statement[:400]}"""
+        prompt = f"Classify this risk into exactly one of these categories: {', '.join(categories)}. Return ONLY the category name.\nRisk: {statement[:400]}"
         response = ai_model.generate_content(prompt)
         result = response.text.strip()
         if result in categories:
@@ -804,14 +507,14 @@ def ai_polish_narrative(snapshot: Dict, company: str) -> str:
 - Critical/high risks: {snapshot.get('critical_count', 0) + snapshot.get('high_count', 0)}
 - Top division: {snapshot.get('top_division', 'N/A')}
 - Appetite breached: {snapshot.get('pct_breached', 0)}%
-Be concise, actionable, and use professional risk language."""
+Be concise, actionable."""
         response = ai_model.generate_content(prompt)
         return response.text.strip() if response.text else ""
     except:
         return ""
 
 # =============================================================================
-# WEIGHTED TREATMENT CONFIDENCE
+# INTELLIGENCE ENGINE
 # =============================================================================
 def calculate_weighted_treatment_confidence(row: pd.Series) -> float:
     score = 0.0
@@ -848,9 +551,6 @@ def calculate_weighted_treatment_confidence(row: pd.Series) -> float:
         score += weights["control"] * 40
     return round(score, 1)
 
-# =============================================================================
-# RISK INTELLIGENCE ENGINE
-# =============================================================================
 def appetite_band(score: float, threshold: int, category: str = "", category_appetite: Dict = None) -> str:
     if pd.isna(score):
         return "unknown"
@@ -902,7 +602,6 @@ def build_intelligence_snapshot(df: pd.DataFrame, threshold: int, category_appet
     snapshot["high_count"] = int((df["residual_level"] == "High").sum())
     snapshot["avg_residual"] = round(df["residual_score"].mean(), 1)
     snapshot["avg_inherent"] = round(df["inherent_score"].mean(), 1)
-    
     exposure_by_div = df.groupby("division")["residual_score"].sum().sort_values(ascending=False)
     if not exposure_by_div.empty:
         snapshot["top_division"] = exposure_by_div.index[0]
@@ -912,15 +611,12 @@ def build_intelligence_snapshot(df: pd.DataFrame, threshold: int, category_appet
         snapshot["top_division"] = "N/A"
         snapshot["top_division_pct"] = 0
         snapshot["division_exposure"] = {}
-    
     exposure_by_cat = df.groupby("category")["residual_score"].sum().sort_values(ascending=False)
     snapshot["category_exposure"] = exposure_by_cat.head(5).to_dict()
-    
     df["appetite_band"] = df.apply(lambda row: appetite_band(row["residual_score"], threshold, row.get("category", ""), category_appetite), axis=1)
     snapshot["pct_within_appetite"] = round((df["appetite_band"] == "within appetite").mean() * 100, 1)
     snapshot["pct_near_appetite"] = round((df["appetite_band"] == "near appetite").mean() * 100, 1)
     snapshot["pct_breached"] = round((df["appetite_band"].isin(["breached", "critical breach"])).mean() * 100, 1)
-    
     snapshot["emerging_themes"] = detect_emerging_themes(df)
     snapshot["ownership_coverage"] = round((df["owner"].astype(str).str.lower() != "not assigned").mean() * 100, 1)
     snapshot["enterprise_health_score"] = calculate_enterprise_health_score(df)
@@ -947,9 +643,6 @@ def compare_snapshots(current: Dict, previous: Dict) -> Dict[str, Any]:
         "appetite_delta": current.get("pct_breached", 0) - previous.get("pct_breached", 0),
     }
 
-# =============================================================================
-# BOARD NARRATIVE
-# =============================================================================
 def generate_board_narrative(snapshot: Dict, comparison: Dict, threshold: int, company: str, report_title: str, ai_summary: str = "") -> str:
     narrative = []
     narrative.append(f"# {report_title}")
@@ -1181,20 +874,9 @@ def render_parser_audit_panel():
         with st.expander("🔍 Parser Audit & Diagnostics", expanded=False):
             st.markdown("**Ingestion Confidence Report**")
             audit = st.session_state.parser_audit
-            col1, col2, col3 = st.columns(3)
+            col1, col2 = st.columns(2)
             col1.metric("Files Processed", audit.get("total_files", 0))
-            col2.metric("Rows Scanned", audit.get("total_rows_scanned", 0))
-            col3.metric("Valid Risks Extracted", audit.get("unique_risks", 0))
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Taxonomy Rows Filtered", audit.get("total_filtered_taxonomy", 0))
-            col2.metric("Header Rows Filtered", audit.get("total_filtered_header", 0))
-            col3.metric("Short Rows Filtered", audit.get("total_filtered_short", 0))
-            if audit.get("total_filtered_metadata", 0) > 0:
-                st.info(f"📋 Metadata rows filtered: {audit.get('total_filtered_metadata', 0)}")
-            if audit.get("total_missing_formula_values", 0) > 0:
-                st.warning(f"⚠️ Formula cells without cached values: {audit.get('total_missing_formula_values', 0)}. Default scores were applied.")
-            confidence = "High" if audit.get("unique_risks", 0) > 10 else "Medium" if audit.get("unique_risks", 0) > 3 else "Low"
-            st.info(f"**Extraction Confidence:** {confidence} – {audit.get('unique_risks', 0)} validated risk statements")
+            col2.metric("Total Risks", audit.get("total_risks", 0))
 
 def render_sidebar():
     with st.sidebar:
@@ -1293,9 +975,9 @@ def render_sidebar():
                     st.session_state.category_appetite[cat] = new_val
         st.session_state.primary_color = st.color_picker("Primary Color", st.session_state.primary_color)
         st.session_state.secondary_color = st.color_picker("Secondary Color", st.session_state.secondary_color)
-        st.checkbox("🔧 Debug Mode (show parser details)", key="debug_mode")
+        st.checkbox("🔧 Debug Mode", key="debug_mode")
         if GEMINI_AVAILABLE:
-            st.checkbox("🤖 Force Gemini Extraction (use AI to extract risks)", key="force_gemini", value=True)
+            st.checkbox("🤖 Force Gemini Extraction", key="force_gemini", value=True)
 
 # =============================================================================
 # MAIN APP
@@ -1304,7 +986,6 @@ def main():
     apply_custom_theme(st.session_state.primary_color, st.session_state.secondary_color)
     render_sidebar()
 
-    # Hero banner - no raw HTML
     col_logo, col_text = st.columns([1, 5])
     with col_logo:
         if st.session_state.logo_bytes:
@@ -1316,6 +997,11 @@ def main():
         st.caption(st.session_state.report_title)
     
     render_parser_audit_panel()
+    
+    if GEMINI_AVAILABLE:
+        st.success("✅ Gemini API is configured and ready")
+    else:
+        st.error("❌ Gemini API key not found")
     
     if st.session_state.tier == "free":
         st.info("🔓 Free tier: 1 file, preview only. Upgrade for full features.")
@@ -1341,9 +1027,10 @@ def main():
                             st.markdown(f"**File {i+1}**")
                             st.json(debug)
                 else:
-                    for debug in debug_list:
-                        if debug.get("confidence_level") == "Low":
-                            st.warning(f"⚠️ Parser confidence low for one file. Inferred columns: {debug.get('inferred_columns', [])}")
+                    st.success(f"✅ {len(df_all)} risks processed")
+                    if st.session_state.debug_mode:
+                        with st.expander("🔧 Parsed Risks Preview"):
+                            st.dataframe(df_all.head(20))
                     
                     category_appetite = st.session_state.category_appetite if st.session_state.tier == "enterprise" else None
                     snapshot = build_intelligence_snapshot(df_all, st.session_state.board_threshold, category_appetite)
@@ -1386,7 +1073,6 @@ def main():
                     st.session_state.history.append(snapshot)
                     if len(st.session_state.history) > 4:
                         st.session_state.history = st.session_state.history[-4:]
-                    st.success(f"✅ {len(df_all)} risks processed")
                     if st.session_state.tier != "free":
                         excel_data = generate_excel_pack(st.session_state.rf_data, narrative)
                         st.download_button("📥 Excel Board Pack", excel_data, file_name=f"RiskForge_{datetime.now().strftime('%Y%m%d')}.xlsx")
