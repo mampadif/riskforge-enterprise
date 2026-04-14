@@ -13,14 +13,15 @@ import hashlib
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 from reportlab.lib.pagesizes import letter, landscape
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.units import inch
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 
 # Optional imports
 try:
@@ -30,9 +31,9 @@ try:
 except ImportError:
     EMBEDDING_AVAILABLE = False
 
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
+# =============================================================================
+# CONFIGURATION & SECRETS
+# =============================================================================
 st.set_page_config(page_title="RiskForge Enterprise", page_icon="🛡️", layout="wide")
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
@@ -49,15 +50,17 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     GEMINI_AVAILABLE = True
     ai_model = genai.GenerativeModel("gemini-2.0-flash")
+    print(f"✅ Gemini configured with API key: {GEMINI_API_KEY[:10]}...")
 else:
     GEMINI_AVAILABLE = False
     ai_model = None
+    print("❌ No Gemini API key found in secrets")
 
 stripe.api_key = STRIPE_SECRET_KEY if STRIPE_SECRET_KEY else None
 
-# -----------------------------------------------------------------------------
-# Session State
-# -----------------------------------------------------------------------------
+# =============================================================================
+# SESSION STATE
+# =============================================================================
 if "tier" not in st.session_state:
     st.session_state.tier = "free"
 if "rf_data" not in st.session_state:
@@ -86,6 +89,8 @@ if "debug_mode" not in st.session_state:
     st.session_state.debug_mode = False
 if "force_gemini" not in st.session_state:
     st.session_state.force_gemini = False
+if "gemini_response" not in st.session_state:
+    st.session_state.gemini_response = None
 
 def handle_payment_success(plan: str):
     if plan in ("pro_monthly", "pro_annual"):
@@ -101,9 +106,9 @@ for param in ["success_pro_monthly", "success_pro_annual", "success_ent_monthly"
             handle_payment_success("ent_monthly" if "monthly" in param else "ent_annual")
         st.query_params.clear()
 
-# -----------------------------------------------------------------------------
-# Helper Functions
-# -----------------------------------------------------------------------------
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
 def clean_division_name(filename: str) -> str:
     name = re.sub(r"\.xlsx$|\.xls$|\.csv$", "", filename, flags=re.IGNORECASE)
     name = re.sub(r"^copy of\s+", "", name, flags=re.IGNORECASE)
@@ -111,27 +116,107 @@ def clean_division_name(filename: str) -> str:
     name = re.sub(r"\s+", " ", name)
     return name.title() if name else "Unknown Division"
 
-# -----------------------------------------------------------------------------
-# GEMINI EXTRACTION (Primary method)
-# -----------------------------------------------------------------------------
-def gemini_extract_risks(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    """Use Gemini to extract risks directly - this is the most reliable method."""
+def normalize_text(text: Any) -> str:
+    if pd.isna(text):
+        return ""
+    return str(text).strip().lower()
+
+def parse_risk_score(val: Any) -> Optional[float]:
+    if pd.isna(val):
+        return None
+    s = str(val).strip().lower()
+    text_map = {
+        "low": 5.0, "medium": 10.0, "moderate": 10.0, "high": 15.0,
+        "very high": 20.0, "critical": 25.0, "extreme": 25.0,
+        "minor": 5.0, "major": 15.0, "severe": 20.0,
+    }
+    if s in text_map:
+        return text_map[s]
+    match = re.search(r'(\d+(?:\.\d+)?)', s)
+    if match:
+        num = float(match.group(1))
+        if 1 <= num <= 5:
+            return num * 5
+        if 1 <= num <= 10:
+            return num * 2.5
+        if 1 <= num <= 25:
+            return num
+    return None
+
+# =============================================================================
+# METADATA DETECTION
+# =============================================================================
+METADATA_PHRASES = [
+    "bitri risk monitoring tool",
+    "risk champion team leader",
+    "period of assessment",
+    "department/ unit",
+    "description of control",
+    "overall effectiveness of controls",
+    "control categorisation",
+    "control categorization",
+    "overall status of action plan",
+    "new and old risks form",
+    "processed by",
+    "approved by",
+    "recommended by",
+    "current controls",
+    "action plan",
+    "residual risk",
+    "risk strategy",
+    "inherent risk",
+    "risk owner",
+    "impact rating",
+    "likelihood rating",
+    "root cause",
+    "consequences",
+    "action plans",
+    "start date",
+    "target completion date",
+    "responsible person",
+    "cost of planned task",
+    "progress report",
+    "outstanding items",
+    "status",
+    "recommended by",
+    "signature",
+]
+
+def is_metadata_row(text: str) -> bool:
+    if not text or not isinstance(text, str):
+        return True
+    text_lower = text.lower().strip()
+    for phrase in METADATA_PHRASES:
+        if phrase in text_lower:
+            return True
+    if len(text_lower.split()) <= 4 and any(word in text_lower for word in ["risk", "assessment", "department", "control", "status", "action", "plan", "owner", "rating"]):
+        return True
+    return False
+
+# =============================================================================
+# GEMINI EXTRACTION (FORCED PRIMARY)
+# =============================================================================
+def gemini_extract_risks_from_file(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    """Use Gemini to extract risks - called FIRST when force_gemini is enabled."""
+    
     if not GEMINI_AVAILABLE:
-        return pd.DataFrame(), {"error": "Gemini API key not configured"}
+        return pd.DataFrame(), {"error": "Gemini API key not configured. Please add GEMINI_API_KEY to secrets."}
     
     if st.session_state.tier == "free" and not st.session_state.force_gemini:
         return pd.DataFrame(), {"error": "Enable 'Force Gemini Extraction' in sidebar"}
     
+    st.info("🤖 Using Gemini AI to extract risks from your file...")
+    
     try:
-        # Read all sheets as text
+        # Read all sheets as structured text
         xls = pd.ExcelFile(io.BytesIO(file_bytes))
         all_content = []
         
         for sheet in xls.sheet_names:
             df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None)
-            # Convert to string with row/col references to help Gemini understand layout
-            sheet_str = f"SHEET: {sheet}\n"
-            for i in range(min(50, df.shape[0])):
+            # Convert to readable format
+            sheet_str = f"\n[SHEET: {sheet}]\n"
+            for i in range(min(100, df.shape[0])):
                 row_vals = []
                 for j in range(min(30, df.shape[1])):
                     val = df.iat[i, j]
@@ -141,45 +226,44 @@ def gemini_extract_risks(file_bytes: bytes, file_name: str, default_residual: in
                     sheet_str += f"Row {i+1}: {' | '.join(row_vals)}\n"
             all_content.append(sheet_str)
         
-        content = "\n\n".join(all_content)
-        if len(content) > 10000:
-            content = content[:10000]
+        content = "\n".join(all_content)
+        if len(content) > 15000:
+            content = content[:15000]
+        
+        # Store for debug
+        st.session_state.gemini_response = {"content_length": len(content), "content_preview": content[:1000]}
         
         prompt = f"""
 You are a risk extraction engine. The content below is from an Excel risk register with multiple sheets.
-Each sheet contains ONE risk in a form format with labeled fields.
+Extract **all risks** as a JSON list. Each risk must have:
 
-Extract ALL risks as a JSON list. For each risk, extract:
-
-- risk_statement: The full description of what could go wrong (look for labels like "Risk Definition", "Risk Statement", "Risk Description")
-- risk_name: A short title (look for "Name of risk", "Risk Name")
-- owner: The risk owner (look for "Risk Owner", "Owner")
-- residual_score: A number 1-25 (look for "Residual Risk", "Residual Score")
+- risk_statement: The full description of what could go wrong (look for phrases like "risk of...", "potential for...", "inability to...", "failure to...")
+- risk_name: A short title (max 80 chars)
+- owner: The person or role responsible (look for "Risk Owner", "Owner")
+- residual_score: A number 1-25 (look for "Residual Risk", "Residual Score", or estimate from impact/likelihood)
 - impact_score: A number 1-5 (look for "Impact rating", "Impact")
 - likelihood_score: A number 1-5 (look for "Likelihood rating", "Likelihood")
 - division: Department or unit (look for "Department/Unit", "Division")
 
-IMPORTANT: Do NOT extract metadata like:
-- "Control categorisation"
-- "Processed by"
-- "Approved by"
-- "NEW AND OLD RISKS FORM"
-- "Action plans"
-- "Current controls"
-
-If you cannot find a specific field, use null for optional fields or estimate for required ones.
+IMPORTANT RULES:
+1. ONLY extract actual risk statements - things that describe something that could go wrong
+2. DO NOT extract metadata like: "Risk Champion Team Leader", "Period of Assessment", "Department/Unit", "Description of Control", "Overall effectiveness of controls", "Control categorisation", "Overall status of Action Plan"
+3. DO NOT extract column headers or form labels
+4. If a sheet contains a form with labeled fields (like "Name of risk:", "Risk definition:"), extract that as ONE risk
+5. If a sheet contains a table with multiple rows, extract each row as a separate risk
+6. Use your judgment: a risk statement is typically a sentence describing a potential problem
 
 Return ONLY valid JSON. Example format:
 {{
   "risks": [
     {{
-      "risk_statement": "Description of the risk...",
-      "risk_name": "Short title",
-      "owner": "Person/role",
-      "residual_score": 12,
+      "risk_statement": "Loss of skilled staff due to uncompetitive conditions",
+      "risk_name": "Staff Turnover",
+      "owner": "HR Director",
+      "residual_score": 16,
       "impact_score": 4,
-      "likelihood_score": 3,
-      "division": "Department name"
+      "likelihood_score": 4,
+      "division": "Human Resources"
     }}
   ]
 }}
@@ -187,9 +271,11 @@ Return ONLY valid JSON. Example format:
 Content:
 {content}
 """
-        with st.spinner("Calling Gemini AI to extract risks..."):
+        with st.spinner("Calling Gemini API (this may take 10-20 seconds)..."):
             response = ai_model.generate_content(prompt)
             text = response.text.strip()
+        
+        st.session_state.gemini_response["raw_response"] = text
         
         # Clean JSON
         if text.startswith("```json"):
@@ -199,6 +285,7 @@ Content:
         if text.endswith("```"):
             text = text[:-3]
         
+        # Parse JSON
         data = json.loads(text)
         if "risks" in data:
             risks = data["risks"]
@@ -213,6 +300,8 @@ Content:
                 continue
             risk_statement = r.get("risk_statement", "")
             if not risk_statement or len(risk_statement) < 15:
+                continue
+            if is_metadata_row(risk_statement):
                 continue
             
             rows.append({
@@ -232,60 +321,95 @@ Content:
                 "likelihood_score": r.get("likelihood_score"),
             })
         
-        return pd.DataFrame(rows), {"gemini_extracted": len(rows)}
+        if rows:
+            st.success(f"✅ Gemini extracted {len(rows)} risks")
+            return pd.DataFrame(rows), {"gemini_extracted": len(rows), "raw_response": text[:500] if st.session_state.debug_mode else None}
+        else:
+            return pd.DataFrame(), {"error": "Gemini found no valid risks", "raw_response": text[:500] if st.session_state.debug_mode else None}
+            
+    except json.JSONDecodeError as e:
+        return pd.DataFrame(), {"error": f"Gemini returned invalid JSON: {str(e)}", "raw_response": text[:500] if 'text' in locals() else None}
     except Exception as e:
         return pd.DataFrame(), {"error": f"Gemini extraction failed: {str(e)}"}
 
+# =============================================================================
+# TEST GEMINI CONNECTION
+# =============================================================================
+def test_gemini_connection():
+    if not GEMINI_AVAILABLE:
+        return "❌ Gemini API key not configured"
+    try:
+        response = ai_model.generate_content("Say 'Gemini is working'")
+        return f"✅ Gemini is working! Response: {response.text[:100]}"
+    except Exception as e:
+        return f"❌ Gemini error: {str(e)}"
+
+# =============================================================================
+# TABULAR PARSER (fallback)
+# =============================================================================
+def extract_tabular_risks(df: pd.DataFrame, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    if df.empty:
+        return pd.DataFrame(), {}
+    
+    # Try to find a column that might contain risk statements
+    risk_col = None
+    for col in df.columns:
+        col_lower = str(col).lower()
+        if any(term in col_lower for term in ["risk", "statement", "description", "event"]):
+            risk_col = col
+            break
+    if risk_col is None:
+        risk_col = df.columns[0]
+    
+    risks = []
+    for _, row in df.iterrows():
+        text = str(row[risk_col]) if pd.notna(row[risk_col]) else ""
+        if len(text) < 15:
+            continue
+        if is_metadata_row(text):
+            continue
+        risks.append({
+            "division": clean_division_name(file_name),
+            "division_confidence": 0.5,
+            "division_source": "tabular",
+            "risk_name": text[:50],
+            "risk_statement": text[:500],
+            "category": "Uncategorised",
+            "residual_score": default_residual,
+            "inherent_score": min(25, default_residual + 3),
+            "owner": "Not assigned",
+            "status": "Active",
+            "due_date": None,
+            "control_effectiveness": "Not rated",
+            "impact_score": None,
+            "likelihood_score": None,
+        })
+    return pd.DataFrame(risks), {"tabular_extracted": len(risks)}
+
 # -----------------------------------------------------------------------------
-# Main Parser Dispatcher
+# MAIN PARSER DISPATCHER
 # -----------------------------------------------------------------------------
 def parse_uploaded_file_bytes(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    # Use Gemini if forced or on Professional/Enterprise
+    # Strategy 1: Gemini FIRST (if forced or Professional/Enterprise)
     if GEMINI_AVAILABLE and (st.session_state.tier != "free" or st.session_state.force_gemini):
-        risks_df, debug = gemini_extract_risks(file_bytes, file_name, default_residual)
+        st.info("🤖 Using Gemini AI extraction (forced mode)")
+        risks_df, debug = gemini_extract_risks_from_file(file_bytes, file_name, default_residual)
         if not risks_df.empty:
             return risks_df, debug
+        else:
+            st.warning(f"Gemini extraction failed: {debug.get('error', 'Unknown error')}. Falling back to tabular parser.")
     
-    # Fallback: try to read as simple tabular
+    # Strategy 2: Tabular parser
     try:
         if file_name.endswith('.csv'):
             df = pd.read_csv(io.BytesIO(file_bytes))
         else:
             df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
             combined = pd.concat(df.values(), ignore_index=True)
-        
-        # Try to find a column with risk descriptions
-        risk_col = None
-        for col in combined.columns:
-            if "risk" in str(col).lower():
-                risk_col = col
-                break
-        if risk_col is None:
-            risk_col = combined.columns[0]
-        
-        risks = []
-        for _, row in combined.iterrows():
-            text = str(row[risk_col]) if pd.notna(row[risk_col]) else ""
-            if len(text) > 20 and not any(p in text.lower() for p in ["control categorisation", "processed by", "approved by"]):
-                risks.append({
-                    "division": clean_division_name(file_name),
-                    "division_confidence": 0.5,
-                    "division_source": "tabular",
-                    "risk_name": text[:50],
-                    "risk_statement": text[:500],
-                    "category": "Uncategorised",
-                    "residual_score": default_residual,
-                    "inherent_score": min(25, default_residual + 3),
-                    "owner": "Not assigned",
-                    "status": "Active",
-                    "due_date": None,
-                    "control_effectiveness": "Not rated",
-                    "impact_score": None,
-                    "likelihood_score": None,
-                })
-        if risks:
-            return pd.DataFrame(risks), {"tabular_extracted": len(risks)}
-    except:
+        risks_df, debug = extract_tabular_risks(combined, file_name, default_residual)
+        if not risks_df.empty:
+            return risks_df, debug
+    except Exception as e:
         pass
     
     return pd.DataFrame(), {"error": "No risks could be extracted"}
@@ -317,9 +441,9 @@ def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[p
 def cached_parse_file(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
     return parse_uploaded_file_bytes(file_bytes, file_name, default_residual)
 
-# -----------------------------------------------------------------------------
-# Semantic Duplicate Detection
-# -----------------------------------------------------------------------------
+# =============================================================================
+# SEMANTIC DUPLICATE DETECTION
+# =============================================================================
 def normalize_for_dedupe(text: str) -> str:
     if not isinstance(text, str):
         return ""
@@ -337,7 +461,7 @@ def embedding_similarity(texts: List[str]) -> Optional[np.ndarray]:
     try:
         embeddings = model.encode(texts)
         return cosine_similarity(embeddings)
-    except:
+    except Exception:
         return None
 
 @st.cache_resource
@@ -377,9 +501,9 @@ def detect_semantic_duplicates(df: pd.DataFrame, threshold: float = 0.85) -> Tup
     deduped = deduped.drop(columns=["_normalized", "_hash"])
     return deduped, duplicates_df
 
-# -----------------------------------------------------------------------------
-# AI Functions (Category, Narrative)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# AI FUNCTIONS
+# =============================================================================
 def ai_infer_category(statement: str, fallback: str = "Uncategorised") -> str:
     categories = ["Strategic", "Financial", "Operational", "ICT/Cyber", "Compliance/Legal", "People/HR", "Health/Safety", "Reputational", "Environmental"]
     if not GEMINI_AVAILABLE or len(statement) < 20:
@@ -409,9 +533,9 @@ Be concise, actionable."""
     except:
         return ""
 
-# -----------------------------------------------------------------------------
-# Intelligence Engine
-# -----------------------------------------------------------------------------
+# =============================================================================
+# INTELLIGENCE ENGINE
+# =============================================================================
 def calculate_weighted_treatment_confidence(row: pd.Series) -> float:
     score = 0.0
     weights = {"owner": 0.3, "due_date": 0.25, "status": 0.25, "control": 0.2}
@@ -591,9 +715,9 @@ def generate_board_narrative(snapshot: Dict, comparison: Dict, threshold: int, c
         narrative.append("")
     return "\n".join(narrative)
 
-# -----------------------------------------------------------------------------
-# Charts
-# -----------------------------------------------------------------------------
+# =============================================================================
+# CHARTS
+# =============================================================================
 def create_category_chart(df: pd.DataFrame) -> go.Figure:
     if df.empty:
         return go.Figure()
@@ -633,9 +757,9 @@ def create_treatment_gauge(confidence: float) -> go.Figure:
     fig.update_layout(height=250, margin=dict(l=10, r=10, t=50, b=10))
     return fig
 
-# -----------------------------------------------------------------------------
-# Excel & PDF Exports
-# -----------------------------------------------------------------------------
+# =============================================================================
+# EXCEL & PDF EXPORTS
+# =============================================================================
 def style_excel_with_risk_colors(wb):
     level_colors = {
         "Critical": PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid"),
@@ -771,9 +895,9 @@ def cached_ai_summary(snapshot_json: str, company: str) -> str:
     snapshot = json.loads(snapshot_json)
     return ai_polish_narrative(snapshot, company)
 
-# -----------------------------------------------------------------------------
-# UI Components
-# -----------------------------------------------------------------------------
+# =============================================================================
+# UI COMPONENTS
+# =============================================================================
 def apply_custom_theme(primary: str, secondary: str) -> None:
     st.markdown(f"""
     <style>
@@ -896,15 +1020,24 @@ def render_sidebar():
         st.session_state.secondary_color = st.color_picker("Secondary Color", st.session_state.secondary_color)
         st.checkbox("🔧 Debug Mode (show parser details)", key="debug_mode")
         if GEMINI_AVAILABLE:
-            st.checkbox("🤖 Force Gemini Extraction (recommended for this file)", key="force_gemini", value=True)
+            st.checkbox("🤖 Force Gemini Extraction (USE AI - RECOMMENDED)", key="force_gemini", value=True)
+        
+        # Gemini test button
+        if st.button("🔌 Test Gemini Connection"):
+            result = test_gemini_connection()
+            if "✅" in result:
+                st.success(result)
+            else:
+                st.error(result)
 
-# -----------------------------------------------------------------------------
-# Main App
-# -----------------------------------------------------------------------------
+# =============================================================================
+# MAIN APP
+# =============================================================================
 def main():
     apply_custom_theme(st.session_state.primary_color, st.session_state.secondary_color)
     render_sidebar()
 
+    # Hero banner
     col_logo, col_text = st.columns([1, 5])
     with col_logo:
         if st.session_state.logo_bytes:
@@ -917,10 +1050,16 @@ def main():
     
     render_parser_audit_panel()
     
+    # Show Gemini status
+    if GEMINI_AVAILABLE:
+        st.info("✅ Gemini API is configured and ready")
+    else:
+        st.error("❌ Gemini API key not found. Please add GEMINI_API_KEY to your secrets.toml")
+    
     if st.session_state.tier == "free":
         st.info("🔓 Free tier: 1 file, preview only. Upgrade for full features.")
         if GEMINI_AVAILABLE and not st.session_state.force_gemini:
-            st.warning("⚠️ For accurate extraction from this file, enable 'Force Gemini Extraction' in the sidebar.")
+            st.warning("⚠️ Enable 'Force Gemini Extraction' in the sidebar for accurate risk extraction.")
     
     max_files = 1 if st.session_state.tier == "free" else 999
     uploaded_files = st.file_uploader("Upload risk registers (Excel/CSV)", accept_multiple_files=True, type=["xlsx", "xls", "csv"])
@@ -942,6 +1081,9 @@ def main():
                         for i, debug in enumerate(debug_list):
                             st.markdown(f"**File {i+1}**")
                             st.json(debug)
+                        if st.session_state.gemini_response:
+                            st.subheader("🤖 Gemini Raw Response")
+                            st.text(st.session_state.gemini_response.get("raw_response", "No response")[:2000])
                 else:
                     st.success(f"✅ {len(df_all)} risks processed")
                     if st.session_state.debug_mode:
