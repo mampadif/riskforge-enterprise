@@ -1467,48 +1467,19 @@ def render_sidebar():
 def main():
     apply_custom_theme(st.session_state.primary_color, st.session_state.secondary_color)
     render_sidebar()
-    
-    st.markdown("""
-    <style>
-    .riskforge-hero {
-        background: linear-gradient(135deg, #173a5e, #1e5c7a);
-        padding: 28px 36px;
-        border-radius: 18px;
-        margin-bottom: 24px;
-        color: white;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-    }
-    .riskforge-hero-title {
-        font-size: 1.9rem;
-        font-weight: 800;
-        display: flex;
-        align-items: center;
-        gap: 12px;
-    }
-    .riskforge-hero-subtitle {
-        font-size: 1rem;
-        opacity: 0.85;
-        margin-top: 6px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    org_name = st.session_state.get("org_name", "Your Organisation")
-    report_title = st.session_state.get("report_title", "Enterprise Risk Overview")
-    logo_html = ""
-    if st.session_state.logo_bytes:
-        b64 = base64.b64encode(st.session_state.logo_bytes).decode()
-        logo_html = f'<img src="data:image/png;base64,{b64}" style="height:45px; width:auto; border-radius:8px;" />'
-    
-    st.markdown(f"""
-    <div class="riskforge-hero">
-        <div class="riskforge-hero-title">
-            {logo_html}
-            <span>🛡️ {org_name}</span>
-        </div>
-        <div class="riskforge-hero-subtitle">{report_title}</div>
-    </div>
-    """, unsafe_allow_html=True)
+
+    # -------------------------------------------------------------------------
+    # Hero banner – no raw HTML, using native Streamlit components
+    # -------------------------------------------------------------------------
+    col_logo, col_text = st.columns([1, 5])
+    with col_logo:
+        if st.session_state.logo_bytes:
+            st.image(st.session_state.logo_bytes, width=60)
+        else:
+            st.markdown("### 🛡️")
+    with col_text:
+        st.title(st.session_state.org_name)
+        st.caption(st.session_state.report_title)
     
     render_parser_audit_panel()
     
