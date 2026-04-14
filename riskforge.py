@@ -1135,25 +1135,18 @@ def render_sidebar():
             st.markdown("---")
             st.markdown("### 🚀 Upgrade")
             
-            # IMPROVED PRICING SECTION: prices placed after plan names, no redundant tables
+            # Professional plan description (prices inline)
             st.markdown("""
 **Professional** – $29/month or $99/year  
 - Full board pack  
 - AI briefing  
 - Heatmaps  
 - Category/Division charts  
-
-**Enterprise** – $99/month or $299/year  
-- Branded PDF board pack  
-- Committee-ready exports  
-- White-label reports  
-- Priority support  
-- Custom appetite thresholds  
 """)
-            
+            # Professional buttons with prices
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("Pro Monthly $29"):
+                if st.button("$29/mo", key="pro_monthly"):
                     if stripe and STRIPE_PRICE_ID_PRO_MONTHLY:
                         session = stripe.checkout.Session.create(
                             payment_method_types=["card"],
@@ -1164,7 +1157,7 @@ def render_sidebar():
                         )
                         st.markdown(f"<a href='{session.url}' target='_blank'>Pay</a>", unsafe_allow_html=True)
             with col2:
-                if st.button("Pro Annual $99"):
+                if st.button("$99/yr", key="pro_annual"):
                     if stripe and STRIPE_PRICE_ID_PRO_ANNUAL:
                         session = stripe.checkout.Session.create(
                             payment_method_types=["card"],
@@ -1174,10 +1167,22 @@ def render_sidebar():
                             cancel_url=APP_URL,
                         )
                         st.markdown(f"<a href='{session.url}' target='_blank'>Pay</a>", unsafe_allow_html=True)
-            st.markdown("---")
+            
+            st.markdown("")  # spacer
+            
+            # Enterprise plan description (prices inline)
+            st.markdown("""
+**Enterprise** – $99/month or $299/year  
+- Branded PDF board pack  
+- Committee-ready exports  
+- White-label reports  
+- Priority support  
+- Custom appetite thresholds  
+""")
+            # Enterprise buttons with prices
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("Ent Monthly $99"):
+                if st.button("$99/mo", key="ent_monthly"):
                     if stripe and STRIPE_PRICE_ID_ENT_MONTHLY:
                         session = stripe.checkout.Session.create(
                             payment_method_types=["card"],
@@ -1188,7 +1193,7 @@ def render_sidebar():
                         )
                         st.markdown(f"<a href='{session.url}' target='_blank'>Pay</a>", unsafe_allow_html=True)
             with col2:
-                if st.button("Ent Annual $299"):
+                if st.button("$299/yr", key="ent_annual"):
                     if stripe and STRIPE_PRICE_ID_ENT_ANNUAL:
                         session = stripe.checkout.Session.create(
                             payment_method_types=["card"],
@@ -1198,6 +1203,7 @@ def render_sidebar():
                             cancel_url=APP_URL,
                         )
                         st.markdown(f"<a href='{session.url}' target='_blank'>Pay</a>", unsafe_allow_html=True)
+            
             st.markdown("---")
             code = st.text_input("Unlock code", type="password")
             if code == PRO_UNLOCK_CODE:
