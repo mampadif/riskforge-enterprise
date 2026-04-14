@@ -204,7 +204,8 @@ def is_valid_risk_statement(text: str) -> bool:
         return False
     text_lower = text_clean.lower()
     blocked = ["approved by", "reviewed by", "submitted by", "signed off", "page ", "confidential", "footer",
-               "current controls", "action plan", "treatment plan", "opportunity response", "treatment strategy"]
+               "current controls", "action plan", "treatment plan", "opportunity response", "treatment strategy",
+               "new and old risks form", "control categorisation", "processed by unit risk champion"]
     if any(p in text_lower for p in blocked):
         return False
     if len(text_clean.split()) <= 2:
@@ -225,16 +226,35 @@ def is_valid_risk_statement(text: str) -> bool:
     return False
 
 # -----------------------------------------------------------------------------
-# BITRI / QUARTER FILE SPECIALISED PARSER
+# BITRI / QUARTER FILE SPECIALISED PARSER (IMPROVED)
 # -----------------------------------------------------------------------------
-def extract_bitri_form_risk(df: pd.DataFrame, sheet_name: str, default_residual: int) -> Optional[Dict]:
+def is_risk_monitoring_sheet(df: pd.DataFrame) -> bool:
+    """Detect any sheet that looks like a risk monitoring form."""
+    if df.empty or df.shape[1] < 2:
+        return False
+    text = " ".join(df.astype(str).values.flatten()).lower()
+    # Look for key indicators of a risk form
+    indicators = [
+        "risk monitoring", "name of risk", "risk name", "risk definition", 
+        "risk statement", "risk owner", "impact rating", "likelihood rating",
+        "residual risk", "inherent risk", "root cause"
+    ]
+    matches = sum(1 for ind in indicators if ind in text)
+    return matches >= 3  # At least 3 indicators
+
+def extract_risk_from_monitoring_form(df: pd.DataFrame, sheet_name: str, default_residual: int) -> Optional[Dict]:
+    """
+    Extract a single risk from a risk monitoring form sheet.
+    Looks for labels and extracts values from adjacent cells.
+    """
     cells = []
-    for i in range(min(200, df.shape[0])):
+    for i in range(min(300, df.shape[0])):
         for j in range(min(50, df.shape[1])):
             val = df.iat[i, j]
             if pd.notna(val):
                 cells.append((i, j, str(val).strip()))
     
+    # Keywords for each field (case-insensitive)
     field_keywords = {
         "risk_name": ["name of risk", "risk name"],
         "risk_statement": ["risk definition", "risk statement", "definition"],
@@ -242,7 +262,8 @@ def extract_bitri_form_risk(df: pd.DataFrame, sheet_name: str, default_residual:
         "impact_rating": ["impact rating", "impact"],
         "likelihood_rating": ["likelihood rating", "likelihood"],
         "residual_risk": ["residual risk", "residual"],
-        "division": ["department/ unit", "division", "unit"]
+        "inherent_risk": ["inherent risk", "inherent"],
+        "division": ["department/ unit", "division", "unit", "department"]
     }
     
     extracted = {}
@@ -250,51 +271,89 @@ def extract_bitri_form_risk(df: pd.DataFrame, sheet_name: str, default_residual:
         for i, j, label in cells:
             label_lower = label.lower()
             if any(kw in label_lower for kw in keywords):
+                # Look right (up to 10 columns)
                 value = None
-                for offset in range(1, 11):
+                for offset in range(1, 15):
                     if j + offset < df.shape[1]:
                         val = df.iat[i, j+offset]
-                        if pd.notna(val) and str(val).strip():
+                        if pd.notna(val) and str(val).strip() and not str(val).strip().lower() in ["", "nan", "none"]:
                             value = str(val).strip()
                             break
+                # If not found, look below (up to 5 rows)
                 if not value:
-                    for offset in range(1, 6):
+                    for offset in range(1, 8):
                         if i + offset < df.shape[0]:
                             val = df.iat[i+offset, j]
-                            if pd.notna(val) and str(val).strip():
+                            if pd.notna(val) and str(val).strip() and not str(val).strip().lower() in ["", "nan", "none"]:
                                 value = str(val).strip()
                                 break
                 if value:
                     extracted[field] = value
                     break
     
+    # Also try to get division from a dedicated cell pattern
     if "division" not in extracted:
         for i, j, val in cells:
-            if "department/ unit" in val.lower() or "division" in val.lower():
+            if "department/ unit" in val.lower() or "division" in val.lower() or "department" in val.lower():
                 if j+1 < df.shape[1] and pd.notna(df.iat[i, j+1]):
                     extracted["division"] = str(df.iat[i, j+1]).strip()
                     break
     
     risk_name = extracted.get("risk_name", "")
     risk_statement = extracted.get("risk_statement", "")
+    
+    # If no risk statement, try to build from name + causes
     if not risk_statement and risk_name:
         risk_statement = risk_name
+        # Look for root causes
+        for i, j, label in cells:
+            if "root cause" in label.lower():
+                for offset in range(1, 10):
+                    if j + offset < df.shape[1]:
+                        val = df.iat[i, j+offset]
+                        if pd.notna(val) and str(val).strip():
+                            risk_statement += f" - Causes: {str(val).strip()}"
+                            break
+                break
+    
     owner = extracted.get("owner", "Not assigned")
     division = extracted.get("division", sheet_name)
     
     impact_score = None
     if "impact_rating" in extracted:
+        # Extract number from string like "Critical (5)" or just "5"
         m = re.search(r'(\d+)', extracted["impact_rating"])
         if m:
             impact_score = int(m.group(1))
+        else:
+            # Try text mapping
+            impact_text = extracted["impact_rating"].lower()
+            impact_map = {"critical": 5, "major": 4, "moderate": 3, "significant": 2, "minor": 1}
+            for k, v in impact_map.items():
+                if k in impact_text:
+                    impact_score = v
+                    break
+    
     likelihood_score = None
     if "likelihood_rating" in extracted:
         m = re.search(r'(\d+)', extracted["likelihood_rating"])
         if m:
             likelihood_score = int(m.group(1))
+        else:
+            likelihood_text = extracted["likelihood_rating"].lower()
+            likelihood_map = {"almost certain": 5, "likely": 4, "moderate": 3, "unlikely": 2, "rare": 1}
+            for k, v in likelihood_map.items():
+                if k in likelihood_text:
+                    likelihood_score = v
+                    break
+    
     residual_score = default_residual
     if "residual_risk" in extracted:
         m = re.search(r'(\d+)', extracted["residual_risk"])
+        if m:
+            residual_score = int(m.group(1))
+    elif "inherent_risk" in extracted:
+        m = re.search(r'(\d+)', extracted["inherent_risk"])
         if m:
             residual_score = int(m.group(1))
     elif impact_score and likelihood_score:
@@ -302,15 +361,23 @@ def extract_bitri_form_risk(df: pd.DataFrame, sheet_name: str, default_residual:
         if residual_score > 25:
             residual_score = min(25, residual_score // 5)
     
+    # Validate: risk_statement must be a real sentence, not a label
     if not risk_statement or len(risk_statement) < 15:
         return None
-    if any(phrase in risk_statement.lower() for phrase in ["control categorisation", "processed by", "recommended by", "approved by"]):
+    
+    # Additional filter: skip rows that are clearly metadata
+    metadata_phrases = [
+        "control categorisation", "processed by", "recommended by", "approved by",
+        "new and old risks form", "bitri risk monitoring tool", "action plans",
+        "current controls", "overall status", "residual risk", "risk strategy"
+    ]
+    if any(phrase in risk_statement.lower() for phrase in metadata_phrases):
         return None
     
     return {
         "division": division,
         "division_confidence": 0.85,
-        "division_source": "bitri_form",
+        "division_source": "monitoring_form",
         "risk_name": risk_name[:80] if risk_name else risk_statement[:50],
         "risk_statement": risk_statement[:500],
         "category": "Uncategorised",
@@ -324,22 +391,17 @@ def extract_bitri_form_risk(df: pd.DataFrame, sheet_name: str, default_residual:
         "likelihood_score": likelihood_score,
     }
 
-def is_bitri_form_sheet(df: pd.DataFrame) -> bool:
-    if df.empty or df.shape[1] < 2:
-        return False
-    text = " ".join(df.astype(str).values.flatten()).lower()
-    return "bitri risk monitoring tool" in text or "risk monitoring tool" in text
-
-def parse_bitri_form_sheets(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+def parse_monitoring_forms(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    """Extract risks from all sheets that look like risk monitoring forms."""
     all_risks = []
-    debug = {"bitri_sheets_found": 0, "risks_extracted": 0}
+    debug = {"sheets_found": 0, "risks_extracted": 0}
     try:
         xls = pd.ExcelFile(io.BytesIO(file_bytes))
         for sheet in xls.sheet_names:
             df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None)
-            if is_bitri_form_sheet(df):
-                debug["bitri_sheets_found"] += 1
-                risk = extract_bitri_form_risk(df, sheet, default_residual)
+            if is_risk_monitoring_sheet(df):
+                debug["sheets_found"] += 1
+                risk = extract_risk_from_monitoring_form(df, sheet, default_residual)
                 if risk:
                     all_risks.append(risk)
                     debug["risks_extracted"] += 1
@@ -357,7 +419,7 @@ def is_generic_form_sheet(df: pd.DataFrame) -> bool:
         return False
     text = " ".join(df.astype(str).values.flatten()).lower()
     labels = ["name of risk", "risk name", "risk definition", "risk statement", "risk owner", "impact rating", "likelihood rating"]
-    return any(label in text for label in labels) and not is_bitri_form_sheet(df)
+    return any(label in text for label in labels)
 
 def extract_generic_form_risk(df: pd.DataFrame, sheet_name: str, default_residual: int) -> Optional[Dict]:
     cells = []
@@ -430,7 +492,8 @@ def extract_generic_form_risk(df: pd.DataFrame, sheet_name: str, default_residua
             residual_score = min(25, residual_score // 5)
     if not risk_statement or len(risk_statement) < 15:
         return None
-    if any(phrase in risk_statement.lower() for phrase in ["control categorisation", "processed by", "recommended by", "approved by"]):
+    metadata_phrases = ["control categorisation", "processed by", "recommended by", "approved by", "new and old risks form"]
+    if any(phrase in risk_statement.lower() for phrase in metadata_phrases):
         return None
     return {
         "division": division,
@@ -483,8 +546,8 @@ def gemini_extract_risks_from_file(file_bytes: bytes, file_name: str, default_re
             all_text = []
             for sheet in xls.sheet_names:
                 sheet_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None)
-                all_text.append(sheet_df.astype(str).to_string())
-            content = "\n".join(all_text)
+                all_text.append(f"=== Sheet: {sheet} ===\n{sheet_df.astype(str).to_string()}")
+            content = "\n\n".join(all_text)
         if len(content) > 8000:
             content = content[:8000]
         prompt = f"""
@@ -498,6 +561,9 @@ Extract **all risks** as a JSON list. Each risk must have:
 - division (string, optional)
 - impact_score (integer 1-5, optional)
 - likelihood_score (integer 1-5, optional)
+
+IMPORTANT: Do NOT extract metadata like "Control categorisation", "Processed by", "Approved by", "NEW AND OLD RISKS FORM".
+Only extract actual risk statements.
 
 Return ONLY valid JSON. Do not include any other text.
 
@@ -538,7 +604,7 @@ Content:
         return pd.DataFrame(), {"error": f"Gemini extraction failed: {str(e)}"}
 
 # -----------------------------------------------------------------------------
-# Tabular Parser (fallback)
+# Tabular Parser (fallback - with metadata filtering)
 # -----------------------------------------------------------------------------
 def extract_tabular_risks(df: pd.DataFrame, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
     if df.empty:
@@ -551,9 +617,17 @@ def extract_tabular_risks(df: pd.DataFrame, file_name: str, default_residual: in
     if risk_col is None:
         risk_col = df.columns[0]
     risks = []
+    metadata_phrases = [
+        "new and old risks form", "control categorisation", "processed by", 
+        "approved by", "recommended by", "current controls", "action plan",
+        "overall status", "residual risk", "risk strategy"
+    ]
     for _, row in df.iterrows():
         text = str(row[risk_col]) if pd.notna(row[risk_col]) else ""
         if len(text) < 12:
+            continue
+        # Skip metadata rows
+        if any(phrase in text.lower() for phrase in metadata_phrases):
             continue
         if not is_valid_risk_statement(text):
             continue
@@ -579,10 +653,10 @@ def extract_tabular_risks(df: pd.DataFrame, file_name: str, default_residual: in
 # Main Dispatcher
 # -----------------------------------------------------------------------------
 def parse_uploaded_file_bytes(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    # Priority 1: BITRI form parser
-    risks_df, debug_bitri = parse_bitri_form_sheets(file_bytes, file_name, default_residual)
+    # Priority 1: Monitoring form parser (for QUARTER files)
+    risks_df, debug_monitor = parse_monitoring_forms(file_bytes, file_name, default_residual)
     if not risks_df.empty:
-        return risks_df, debug_bitri
+        return risks_df, debug_monitor
     # Priority 2: Generic form parser
     risks_df, debug_form = parse_generic_form_sheets(file_bytes, file_name, default_residual)
     if not risks_df.empty:
@@ -727,7 +801,7 @@ Be concise, actionable."""
         return ""
 
 # -----------------------------------------------------------------------------
-# Intelligence Engine (Health, Confidence, Themes)
+# Intelligence Engine
 # -----------------------------------------------------------------------------
 def calculate_weighted_treatment_confidence(row: pd.Series) -> float:
     score = 0.0
