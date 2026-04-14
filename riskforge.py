@@ -398,6 +398,203 @@ def parse_excel_file_bytes(file_bytes: bytes, file_name: str) -> Tuple[pd.DataFr
 
     return combined, debug_info
 
+# -----------------------------------------------------------------------------
+# NEW: FORM-BASED PARSER (generic, works for BITRI and similar templates)
+# -----------------------------------------------------------------------------
+def is_form_sheet(df: pd.DataFrame) -> bool:
+    """Heuristic: sheet contains at least 3 risk‑form labels."""
+    if df.empty or df.shape[1] < 2:
+        return False
+    # Convert entire sheet to lowercase string
+    text = " ".join(df.astype(str).values.flatten()).lower()
+    labels = ["name of risk", "risk definition", "risk statement", "root cause", "risk owner", "impact rating", "likelihood rating"]
+    matches = sum(1 for label in labels if label in text)
+    return matches >= 3
+
+def extract_form_risk(df: pd.DataFrame, sheet_name: str, default_residual: int) -> Optional[Dict]:
+    """Extract a single risk from a form‑based sheet (one risk per sheet)."""
+    # Convert all cells to string, ignore NaN
+    cells = {}
+    for i in range(min(50, df.shape[0])):          # scan first 50 rows
+        for j in range(min(20, df.shape[1])):      # first 20 columns
+            val = df.iat[i, j]
+            if pd.notna(val):
+                key = str(val).strip()
+                if key:
+                    # Look for value in next cell (right or below)
+                    # Common pattern: label in A1, value in B1
+                    if j+1 < df.shape[1] and pd.notna(df.iat[i, j+1]):
+                        cells[key.lower()] = str(df.iat[i, j+1]).strip()
+                    # Also check below (label in A1, value in A2)
+                    elif i+1 < df.shape[0] and pd.notna(df.iat[i+1, j]):
+                        cells[key.lower()] = str(df.iat[i+1, j]).strip()
+    
+    # Map known labels to our internal fields
+    risk_name = ""
+    risk_statement = ""
+    owner = "Not assigned"
+    impact_score = None
+    likelihood_score = None
+    residual_score = default_residual
+    division = sheet_name  # fallback: use sheet name as division
+    
+    # Division might be in a cell like "DEPARTMENT/ UNIT: ORG-NRM"
+    for k, v in cells.items():
+        if "name of risk" in k or "risk name" in k:
+            risk_name = v
+        if "risk definition" in k or "risk statement" in k:
+            risk_statement = v
+        if "risk owner" in k:
+            owner = v
+        if "impact rating" in k or "impact" in k:
+            # extract number like "Critical (5)" or just "5"
+            match = re.search(r'(\d+)', v)
+            if match:
+                impact_score = int(match.group(1))
+        if "likelihood rating" in k or "likelihood" in k:
+            match = re.search(r'(\d+)', v)
+            if match:
+                likelihood_score = int(match.group(1))
+        if "residual risk" in k:
+            match = re.search(r'(\d+)', v)
+            if match:
+                residual_score = int(match.group(1))
+        if "department/ unit" in k or "division" in k:
+            division = v
+    
+    # If no risk statement, try to build from "name of risk" + "root cause(s)"
+    if not risk_statement and risk_name:
+        risk_statement = risk_name
+        # Add root causes if available
+        for k, v in cells.items():
+            if "root cause" in k:
+                risk_statement += f" – Causes: {v}"
+                break
+    
+    # Compute residual if we have impact & likelihood
+    if impact_score and likelihood_score and residual_score == default_residual:
+        residual_score = impact_score * likelihood_score
+        # Normalize to 1-25 scale if needed (assuming 1-5 each)
+        if residual_score > 25:
+            residual_score = min(25, residual_score // 5)
+    
+    if not risk_statement or len(risk_statement) < 15:
+        return None
+    
+    return {
+        "division": division,
+        "division_confidence": 0.8,
+        "division_source": "form_sheet",
+        "risk_name": risk_name[:80] if risk_name else risk_statement[:50],
+        "risk_statement": risk_statement[:500],
+        "category": "Uncategorised",  # will be enriched by AI later if needed
+        "residual_score": min(25, max(1, residual_score)),
+        "inherent_score": min(25, residual_score + 3),
+        "owner": owner,
+        "status": "Active",
+        "due_date": None,
+        "control_effectiveness": "Not rated",
+        "impact_score": impact_score,
+        "likelihood_score": likelihood_score,
+    }
+
+def parse_form_sheets(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    """Extract risks from all form‑like sheets in an Excel file."""
+    all_risks = []
+    debug = {"form_sheets_found": 0, "risks_extracted": 0, "errors": []}
+    try:
+        xls = pd.ExcelFile(io.BytesIO(file_bytes))
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=None)
+            if is_form_sheet(df):
+                debug["form_sheets_found"] += 1
+                risk = extract_form_risk(df, sheet_name, default_residual)
+                if risk:
+                    all_risks.append(risk)
+                    debug["risks_extracted"] += 1
+                else:
+                    debug["errors"].append(f"Sheet '{sheet_name}' looked like a form but extraction failed")
+    except Exception as e:
+        debug["errors"].append(str(e))
+    
+    if not all_risks:
+        return pd.DataFrame(), debug
+    return pd.DataFrame(all_risks), debug
+
+# -----------------------------------------------------------------------------
+# GEMINI FALLBACK PARSER (for Professional/Enterprise)
+# -----------------------------------------------------------------------------
+def ai_parse_file(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    """Use Gemini to extract risks from any unstructured content."""
+    if not GEMINI_AVAILABLE or st.session_state.tier == "free":
+        return pd.DataFrame(), {"error": "Gemini not available or free tier"}
+    
+    # Try to read as text (Excel -> string representation)
+    try:
+        if file_name.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(file_bytes))
+        else:
+            df, _ = parse_excel_file_bytes(file_bytes, file_name)
+        content = df.astype(str).to_string()
+    except:
+        content = "Could not parse file content"
+    
+    prompt = f"""
+You are a risk extraction engine. The content below comes from a risk register.
+Extract all risks as a JSON list. Each risk must have these fields:
+- risk_statement (string)
+- risk_name (string, optional)
+- owner (string)
+- residual_score (integer 1-25, estimate if missing)
+- category (string, choose from: Strategic, Financial, Operational, ICT/Cyber, Compliance/Legal, People/HR, Health/Safety, Reputational, Environmental)
+- division (string, if mentioned)
+- impact_score (integer 1-5, optional)
+- likelihood_score (integer 1-5, optional)
+
+Return ONLY valid JSON. No explanation.
+
+Content:
+{content[:6000]}
+"""
+    try:
+        response = ai_model.generate_content(prompt)
+        text = response.text.strip()
+        # Remove markdown code fences if present
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.endswith("```"):
+            text = text[:-3]
+        risks = json.loads(text)
+        if isinstance(risks, dict) and "risks" in risks:
+            risks = risks["risks"]
+        if not isinstance(risks, list):
+            risks = [risks]
+        
+        rows = []
+        for r in risks:
+            rows.append({
+                "division": r.get("division", "Unassigned"),
+                "division_confidence": 0.5,
+                "division_source": "ai_fallback",
+                "risk_name": r.get("risk_name", r.get("risk_statement", "")[:50]),
+                "risk_statement": r.get("risk_statement", ""),
+                "category": r.get("category", "Uncategorised"),
+                "residual_score": min(25, max(1, int(r.get("residual_score", default_residual)))),
+                "inherent_score": min(25, int(r.get("residual_score", default_residual)) + 3),
+                "owner": r.get("owner", "Not assigned"),
+                "status": "Active",
+                "due_date": None,
+                "control_effectiveness": "Not rated",
+                "impact_score": r.get("impact_score"),
+                "likelihood_score": r.get("likelihood_score"),
+            })
+        return pd.DataFrame(rows), {"ai_extracted": len(rows)}
+    except Exception as e:
+        return pd.DataFrame(), {"error": f"AI extraction failed: {str(e)}"}
+
+# -----------------------------------------------------------------------------
+# EXISTING TABULAR PARSER (unchanged, but we keep it)
+# -----------------------------------------------------------------------------
 def extract_risk_from_dataframe(df: pd.DataFrame, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
     if df.empty:
         return pd.DataFrame(), {}
@@ -585,17 +782,34 @@ def assess_parser_confidence(mapping: Dict[str, str], has_impact_likelihood: boo
     return score, level, inferred
 
 def parse_uploaded_file_bytes(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    # Strategy 1: Try tabular (original) parser
     if file_name.endswith('.csv'):
         try:
             df = pd.read_csv(io.BytesIO(file_bytes))
-            return extract_risk_from_dataframe(df, file_name, default_residual)
+            risks_df, debug = extract_risk_from_dataframe(df, file_name, default_residual)
+            if not risks_df.empty:
+                return risks_df, debug
         except Exception as e:
-            return pd.DataFrame(), {"error": str(e)}
+            pass
     else:
         df, debug_sheets = parse_excel_file_bytes(file_bytes, file_name)
-        if df.empty:
-            return pd.DataFrame(), debug_sheets
-        return extract_risk_from_dataframe(df, file_name, default_residual)
+        if not df.empty:
+            risks_df, debug = extract_risk_from_dataframe(df, file_name, default_residual)
+            if not risks_df.empty:
+                return risks_df, debug
+    
+    # Strategy 2: Form-based parser (one risk per sheet)
+    risks_df, debug_form = parse_form_sheets(file_bytes, file_name, default_residual)
+    if not risks_df.empty:
+        return risks_df, debug_form
+    
+    # Strategy 3: Gemini fallback (Professional/Enterprise only)
+    if st.session_state.tier != "free" and GEMINI_AVAILABLE:
+        risks_df, debug_ai = ai_parse_file(file_bytes, file_name, default_residual)
+        if not risks_df.empty:
+            return risks_df, debug_ai
+    
+    return pd.DataFrame(), {"error": "No risks could be extracted from the file"}
 
 def clean_division_name(filename: str) -> str:
     name = re.sub(r"\.xlsx$|\.xls$|\.csv$", "", filename, flags=re.IGNORECASE)
