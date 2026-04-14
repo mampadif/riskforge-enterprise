@@ -13,15 +13,14 @@ import hashlib
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import PatternFill
 from reportlab.lib.pagesizes import letter, landscape
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.units import inch
-from rapidfuzz import fuzz, process
+from rapidfuzz import fuzz
 
 # Optional imports
 try:
@@ -179,9 +178,17 @@ def make_unique_columns(columns) -> list[str]:
     seen: dict[str, int] = {}
     unique_cols: list[str] = []
     for i, col in enumerate(columns):
-        base = str(col).strip() if col is not None else ""
+        # Convert to string safely, handling non-string values
+        if col is None:
+            base = f"col_{i}"
+        elif isinstance(col, (int, float)):
+            base = f"col_{int(col)}" if col == int(col) else f"col_{i}"
+        else:
+            base = str(col).strip()
+        
         if not base or base.lower() == "nan":
             base = f"col_{i}"
+        
         count = seen.get(base, 0) + 1
         seen[base] = count
         if count == 1:
@@ -190,20 +197,83 @@ def make_unique_columns(columns) -> list[str]:
             unique_cols.append(f"{base}__{count}")
     return unique_cols
 
-def detect_header_row(df: pd.DataFrame, max_rows: int = 10) -> Tuple[int, float]:
-    best_row = 0
-    best_score = 0.0
-    for i in range(min(max_rows, len(df))):
-        row_vals = [normalize_text(x) for x in df.iloc[i].fillna("").tolist()]
-        score = 0
-        risk_keywords = ["risk", "statement", "description", "owner", "score", "category", "division", "impact", "likelihood"]
-        for keyword in risk_keywords:
-            if any(keyword in val for val in row_vals):
-                score += 2
-        if score > best_score:
-            best_score = score
-            best_row = i
-    return best_row, best_score
+# =============================================================================
+# EXCEL PARSER WITH OPENPYXL (FIXED)
+# =============================================================================
+def parse_excel_file_bytes(file_bytes: bytes, file_name: str) -> Tuple[pd.DataFrame, Dict]:
+    all_sheets_data = []
+    debug_info = {"sheets_processed": 0, "rows_scanned": 0, "sheets": []}
+
+    try:
+        wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+
+        for sheet_name in wb.sheetnames:
+            sheet_info = {"sheet_name": sheet_name, "rows_scanned": 0, "rows_extracted": 0}
+            ws = wb[sheet_name]
+            
+            # Convert worksheet to DataFrame
+            data = list(ws.values)
+            if not data:
+                continue
+            df_raw = pd.DataFrame(data)
+            
+            if df_raw.empty or df_raw.shape[1] < 2:
+                continue
+
+            # Try to find header row
+            header_row = 0
+            for i in range(min(20, len(df_raw))):
+                row_text = " ".join([str(x) for x in df_raw.iloc[i].values if pd.notna(x)]).lower()
+                if any(kw in row_text for kw in ["risk", "description", "statement", "impact", "likelihood"]):
+                    header_row = i
+                    break
+
+            sheet_info["header_row_detected"] = header_row
+
+            if header_row > 0:
+                # Convert all header values to strings safely
+                raw_headers = []
+                for x in df_raw.iloc[header_row].tolist():
+                    if pd.isna(x):
+                        raw_headers.append("")
+                    elif isinstance(x, (int, float)):
+                        raw_headers.append(str(int(x)) if x == int(x) else str(x))
+                    else:
+                        raw_headers.append(str(x).strip())
+                
+                headers = make_unique_columns(raw_headers)
+                df = df_raw.iloc[header_row + 1:].reset_index(drop=True)
+                df.columns = headers
+            else:
+                df = df_raw.copy()
+                df.columns = make_unique_columns([f"col_{i}" for i in range(df.shape[1])])
+
+            df = df.dropna(how="all").reset_index(drop=True)
+            if df.empty or len(df) < 2:
+                continue
+
+            sheet_info["rows_scanned"] = len(df)
+            sheet_info["rows_extracted"] = len(df)
+            all_sheets_data.append(df)
+            debug_info["sheets_processed"] += 1
+            debug_info["rows_scanned"] += len(df)
+            debug_info["sheets"].append(sheet_info)
+
+    except Exception as e:
+        st.warning(f"Error parsing {file_name}: {e}")
+        return pd.DataFrame(), debug_info
+
+    if not all_sheets_data:
+        return pd.DataFrame(), debug_info
+
+    try:
+        combined = pd.concat(all_sheets_data, ignore_index=True, sort=False)
+        debug_info["total_rows_combined"] = len(combined)
+    except Exception as e:
+        st.error(f"Sheet consolidation failed for {file_name}: {e}")
+        return pd.DataFrame(), debug_info
+
+    return combined, debug_info
 
 # =============================================================================
 # RELAXED RISK STATEMENT VALIDATOR
@@ -297,81 +367,6 @@ def is_valid_risk_statement(text: str) -> bool:
         return True
 
     return False
-
-# =============================================================================
-# EXCEL PARSER WITH OPENPYXL (data_only=True)
-# =============================================================================
-def parse_excel_file_bytes(file_bytes: bytes, file_name: str) -> Tuple[pd.DataFrame, Dict]:
-    all_sheets_data = []
-    debug_info = {"sheets_processed": 0, "rows_scanned": 0, "sheets": []}
-
-    try:
-        wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
-
-        for sheet_name in wb.sheetnames:
-            sheet_info = {"sheet_name": sheet_name, "rows_scanned": 0, "rows_extracted": 0}
-            ws = wb[sheet_name]
-            
-            # Convert worksheet to DataFrame
-            data = list(ws.values)
-            if not data:
-                continue
-            df_raw = pd.DataFrame(data)
-            
-            if df_raw.empty or df_raw.shape[1] < 2:
-                continue
-
-            # Try to find header row
-            header_row = 0
-            for i in range(min(20, len(df_raw))):
-                row_text = " ".join(df_raw.iloc[i].astype(str).values).lower()
-                if any(kw in row_text for kw in ["risk", "description", "statement", "impact", "likelihood"]):
-                    header_row = i
-                    break
-
-            sheet_info["header_row_detected"] = header_row
-
-            if header_row > 0:
-                raw_headers = [
-                    str(x).strip() if not pd.isna(x) else f"col_{i}"
-                    for i, x in enumerate(df_raw.iloc[header_row].tolist())
-                ]
-                headers = make_unique_columns(raw_headers)
-                df = df_raw.iloc[header_row + 1:].reset_index(drop=True)
-                df.columns = headers
-            else:
-                df = df_raw.copy()
-                df.columns = make_unique_columns([f"col_{i}" for i in range(df.shape[1])])
-
-            df = df.dropna(how="all").reset_index(drop=True)
-            if df.empty or len(df) < 2:
-                continue
-
-            if not df.columns.is_unique:
-                df.columns = make_unique_columns(df.columns)
-
-            sheet_info["rows_scanned"] = len(df)
-            sheet_info["rows_extracted"] = len(df)
-            all_sheets_data.append(df)
-            debug_info["sheets_processed"] += 1
-            debug_info["rows_scanned"] += len(df)
-            debug_info["sheets"].append(sheet_info)
-
-    except Exception as e:
-        st.warning(f"Error parsing {file_name}: {e}")
-        return pd.DataFrame(), debug_info
-
-    if not all_sheets_data:
-        return pd.DataFrame(), debug_info
-
-    try:
-        combined = pd.concat(all_sheets_data, ignore_index=True, sort=False)
-        debug_info["total_rows_combined"] = len(combined)
-    except Exception as e:
-        st.error(f"Sheet consolidation failed for {file_name}: {e}")
-        return pd.DataFrame(), debug_info
-
-    return combined, debug_info
 
 # =============================================================================
 # INTELLIGENT COLUMN DETECTION
