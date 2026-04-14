@@ -85,7 +85,7 @@ if "parser_audit" not in st.session_state:
 if "debug_mode" not in st.session_state:
     st.session_state.debug_mode = False
 if "force_gemini" not in st.session_state:
-    st.session_state.force_gemini = True  # DEFAULT TO TRUE
+    st.session_state.force_gemini = True
 
 def handle_payment_success(plan: str):
     if plan in ("pro_monthly", "pro_annual"):
@@ -133,111 +133,145 @@ def parse_risk_score(val: Any) -> Optional[float]:
             return num
     return None
 
-# =============================================================================
-# METADATA DETECTION
-# =============================================================================
-METADATA_PHRASES = [
-    "bitri risk monitoring tool", "risk champion team leader", "period of assessment",
-    "department/ unit", "description of control", "overall effectiveness of controls",
-    "control categorisation", "overall status of action plan", "new and old risks form",
-    "processed by", "approved by", "recommended by", "current controls", "action plan",
-    "residual risk", "risk strategy", "inherent risk", "risk owner", "impact rating",
-    "likelihood rating", "root cause", "consequences", "start date", "target completion date",
-    "responsible person", "cost of planned task", "progress report", "outstanding items",
-    "link to objective", "risk no", "risk description", "risk definition"
-]
-
 def is_metadata(text: str) -> bool:
     if not text or not isinstance(text, str):
         return True
     text_lower = text.lower().strip()
     if len(text_lower) < 10:
         return True
-    for phrase in METADATA_PHRASES:
+    metadata_phrases = [
+        "link to objective", "risk no", "risk description", "risk definition",
+        "bitri risk monitoring tool", "risk champion team leader", "period of assessment",
+        "department/ unit", "description of control", "overall effectiveness of controls",
+        "control categorisation", "overall status of action plan", "new and old risks form",
+        "processed by", "approved by", "recommended by", "current controls", "action plan",
+        "residual risk", "risk strategy", "inherent risk", "risk owner", "impact rating",
+        "likelihood rating", "root cause", "consequences", "start date", "target completion date"
+    ]
+    for phrase in metadata_phrases:
         if phrase in text_lower:
             return True
     return False
 
 # =============================================================================
-# GEMINI EXTRACTION (PRIMARY)
+# GEMINI EXTRACTION (PRIMARY - WITH DEBUGGING)
 # =============================================================================
 def gemini_extract_risks(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    st.info("🤖 Using Gemini AI to extract risks...")
+    
     if not GEMINI_AVAILABLE:
         return pd.DataFrame(), {"error": "Gemini API key not configured"}
     
-    if st.session_state.tier == "free" and not st.session_state.force_gemini:
-        return pd.DataFrame(), {"error": "Enable Force Gemini Extraction"}
-    
     try:
         xls = pd.ExcelFile(io.BytesIO(file_bytes))
+        st.session_state.gemini_debug = {"sheets": list(xls.sheet_names)}
         
-        # First, try to extract from the consolidated risk register sheet if it exists
+        # Look for consolidated risk register sheet
         if "consolidated risk register" in xls.sheet_names:
+            st.info("📋 Found 'consolidated risk register' sheet - extracting risks directly...")
             df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="consolidated risk register", header=None)
-            # Find the row with column headers
+            
+            # Find the header row (contains "RISK DESCRIPTION")
             header_row = None
             for i in range(min(20, len(df))):
                 row_text = " ".join(df.iloc[i].astype(str).values).lower()
-                if "risk description" in row_text and "impact" in row_text:
+                if "risk description" in row_text:
                     header_row = i
                     break
             
-            if header_row is not None:
-                # Extract data rows below header
-                data_rows = []
-                for i in range(header_row + 1, min(header_row + 50, len(df))):
-                    risk_desc = str(df.iat[i, 2]) if df.shape[1] > 2 else ""  # Column C is RISK DESCRIPTION
-                    if risk_desc and len(risk_desc) > 20 and not is_metadata(risk_desc):
-                        # Get impact (column G, index 6)
-                        impact_val = str(df.iat[i, 6]) if df.shape[1] > 6 else ""
-                        likelihood_val = str(df.iat[i, 8]) if df.shape[1] > 8 else ""
-                        owner = str(df.iat[i, 14]) if df.shape[1] > 14 else "Not assigned"
-                        
-                        impact_score = parse_risk_score(impact_val)
-                        likelihood_score = parse_risk_score(likelihood_val)
-                        residual = default_residual
-                        if impact_score and likelihood_score:
-                            residual = min(25, max(1, (impact_score * likelihood_score) / 5))
-                        
-                        data_rows.append({
-                            "risk_statement": risk_desc[:500],
-                            "risk_name": risk_desc[:50],
-                            "owner": owner if owner != "nan" else "Not assigned",
-                            "residual_score": residual,
-                            "impact_score": impact_score,
-                            "likelihood_score": likelihood_score,
-                            "division": clean_division_name(file_name)
-                        })
+            if header_row is None:
+                return pd.DataFrame(), {"error": "Could not find header row in consolidated sheet"}
+            
+            # Find column indices
+            risk_col = None
+            impact_col = None
+            likelihood_col = None
+            owner_col = None
+            
+            for j, val in enumerate(df.iloc[header_row].astype(str).values):
+                val_lower = val.lower()
+                if "risk description" in val_lower:
+                    risk_col = j
+                elif "impact" in val_lower and "likelihood" not in val_lower:
+                    impact_col = j
+                elif "likelihood" in val_lower:
+                    likelihood_col = j
+                elif "owner" in val_lower:
+                    owner_col = j
+            
+            if risk_col is None:
+                return pd.DataFrame(), {"error": "Risk description column not found"}
+            
+            # Extract risks
+            risks = []
+            for i in range(header_row + 1, min(header_row + 100, len(df))):
+                risk_text = str(df.iat[i, risk_col]) if df.shape[1] > risk_col else ""
+                if not risk_text or risk_text == "nan" or len(risk_text) < 15:
+                    continue
+                if is_metadata(risk_text):
+                    continue
                 
-                if data_rows:
-                    rows = []
-                    for r in data_rows:
-                        rows.append({
-                            "division": r["division"],
-                            "division_confidence": 0.9,
-                            "division_source": "gemini_tabular",
-                            "risk_name": r["risk_name"],
-                            "risk_statement": r["risk_statement"],
-                            "category": "Uncategorised",
-                            "residual_score": r["residual_score"],
-                            "inherent_score": min(25, r["residual_score"] + 3),
-                            "owner": r["owner"],
-                            "status": "Active",
-                            "due_date": None,
-                            "control_effectiveness": "Not rated",
-                            "impact_score": r["impact_score"],
-                            "likelihood_score": r["likelihood_score"],
-                        })
-                    return pd.DataFrame(rows), {"extracted": len(rows), "method": "consolidated_register"}
+                # Get impact and likelihood
+                impact_score = None
+                if impact_col and df.shape[1] > impact_col:
+                    impact_val = str(df.iat[i, impact_col])
+                    impact_score = parse_risk_score(impact_val)
+                
+                likelihood_score = None
+                if likelihood_col and df.shape[1] > likelihood_col:
+                    likelihood_val = str(df.iat[i, likelihood_col])
+                    likelihood_score = parse_risk_score(likelihood_val)
+                
+                # Calculate residual
+                residual = default_residual
+                if impact_score and likelihood_score:
+                    residual = min(25, max(1, (impact_score * likelihood_score) / 5))
+                elif impact_score:
+                    residual = impact_score * 5
+                elif likelihood_score:
+                    residual = likelihood_score * 5
+                
+                # Get owner
+                owner = "Not assigned"
+                if owner_col and df.shape[1] > owner_col:
+                    owner_val = str(df.iat[i, owner_col])
+                    if owner_val and owner_val != "nan":
+                        owner = owner_val
+                
+                risks.append({
+                    "division": clean_division_name(file_name),
+                    "division_confidence": 0.9,
+                    "division_source": "gemini_direct",
+                    "risk_name": risk_text[:50],
+                    "risk_statement": risk_text[:500],
+                    "category": "Uncategorised",
+                    "residual_score": residual,
+                    "inherent_score": min(25, residual + 3),
+                    "owner": owner,
+                    "status": "Active",
+                    "due_date": None,
+                    "control_effectiveness": "Not rated",
+                    "impact_score": impact_score,
+                    "likelihood_score": likelihood_score,
+                })
+            
+            if risks:
+                st.success(f"✅ Extracted {len(risks)} risks from consolidated register")
+                return pd.DataFrame(risks), {"extracted": len(risks), "method": "consolidated_direct"}
+            else:
+                return pd.DataFrame(), {"error": "No valid risks found in consolidated sheet"}
         
-        # If no consolidated sheet, use Gemini to parse all sheets
+        # If no consolidated sheet, use Gemini API
+        st.info("📋 No consolidated sheet found - using Gemini API to parse all sheets...")
+        
+        # Build content for Gemini
         all_content = []
         for sheet in xls.sheet_names:
             if sheet.lower() in ["boundaries", "impact", "likelihood", "effectiveness of control", "risk matrix"]:
                 continue
             df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None)
             sheet_str = f"\n[SHEET: {sheet}]\n"
-            for i in range(min(100, df.shape[0])):
+            for i in range(min(50, df.shape[0])):
                 row_vals = []
                 for j in range(min(20, df.shape[1])):
                     val = df.iat[i, j]
@@ -248,31 +282,32 @@ def gemini_extract_risks(file_bytes: bytes, file_name: str, default_residual: in
             all_content.append(sheet_str)
         
         content = "\n".join(all_content)
-        if len(content) > 10000:
-            content = content[:10000]
+        if len(content) > 8000:
+            content = content[:8000]
         
         prompt = f"""
 You are a risk extraction engine. The content below is from an Excel risk register.
 Extract ALL risks as a JSON list. Each risk must have:
-- risk_statement: the full description
-- risk_name: a short title
-- owner: the risk owner
-- residual_score: integer 1-25
+- risk_statement: the full description (required)
+- risk_name: a short title (optional)
+- owner: the risk owner (optional)
+- residual_score: integer 1-25 (estimate if missing)
 - impact_score: integer 1-5 (optional)
 - likelihood_score: integer 1-5 (optional)
-- division: department/unit
 
-DO NOT extract metadata like "Risk Champion Team Leader", "Period of Assessment", "Control categorisation".
-Only extract actual risk statements.
+DO NOT extract metadata like headers, labels, or control descriptions.
+Only extract actual risk statements that describe something that could go wrong.
 
 Return ONLY valid JSON. Example:
-{{"risks": [{{"risk_statement": "...", "risk_name": "...", "owner": "...", "residual_score": 12}}]}}
+{{"risks": [{{"risk_statement": "Loss of skilled staff...", "risk_name": "Staff Turnover", "owner": "HR Director", "residual_score": 16}}]}}
 
 Content:
 {content}
 """
-        response = ai_model.generate_content(prompt)
-        text = response.text.strip()
+        with st.spinner("Calling Gemini API..."):
+            response = ai_model.generate_content(prompt)
+            text = response.text.strip()
+        
         if text.startswith("```json"):
             text = text[7:]
         if text.startswith("```"):
@@ -291,9 +326,9 @@ Content:
             if not risk_statement or len(risk_statement) < 15 or is_metadata(risk_statement):
                 continue
             rows.append({
-                "division": r.get("division", clean_division_name(file_name)),
+                "division": clean_division_name(file_name),
                 "division_confidence": 0.9,
-                "division_source": "gemini",
+                "division_source": "gemini_api",
                 "risk_name": r.get("risk_name", risk_statement[:50]),
                 "risk_statement": risk_statement[:500],
                 "category": "Uncategorised",
@@ -308,46 +343,40 @@ Content:
             })
         
         if rows:
-            return pd.DataFrame(rows), {"extracted": len(rows), "method": "gemini_full"}
-        return pd.DataFrame(), {"error": "No risks found"}
-        
+            st.success(f"✅ Gemini API extracted {len(rows)} risks")
+            return pd.DataFrame(rows), {"extracted": len(rows), "method": "gemini_api"}
+        else:
+            return pd.DataFrame(), {"error": "Gemini found no risks"}
+            
     except Exception as e:
+        st.error(f"Gemini extraction error: {str(e)}")
         return pd.DataFrame(), {"error": f"Gemini failed: {str(e)}"}
 
 # =============================================================================
-# TABULAR PARSER (FALLBACK)
+# TABULAR PARSER (FALLBACK - ONLY IF GEMINI NOT FORCED)
 # =============================================================================
 def parse_tabular_risks(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
     try:
-        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="consolidated risk register", header=None)
-    except:
-        try:
-            xls = pd.ExcelFile(io.BytesIO(file_bytes))
+        xls = pd.ExcelFile(io.BytesIO(file_bytes))
+        if "consolidated risk register" in xls.sheet_names:
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="consolidated risk register", header=None)
+        else:
             df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=xls.sheet_names[0], header=None)
-        except:
-            return pd.DataFrame(), {"error": "Could not read file"}
+    except:
+        return pd.DataFrame(), {"error": "Could not read file"}
     
     # Find header row
     header_row = None
     risk_col = None
-    impact_col = None
-    likelihood_col = None
-    owner_col = None
     
     for i in range(min(20, len(df))):
         row_text = " ".join(df.iloc[i].astype(str).values).lower()
         if "risk description" in row_text:
             header_row = i
             for j, val in enumerate(df.iloc[i].astype(str).values):
-                val_lower = val.lower()
-                if "risk description" in val_lower:
+                if "risk description" in val.lower():
                     risk_col = j
-                elif "impact" in val_lower and "likelihood" not in val_lower:
-                    impact_col = j
-                elif "likelihood" in val_lower:
-                    likelihood_col = j
-                elif "owner" in val_lower:
-                    owner_col = j
+                    break
             break
     
     if risk_col is None:
@@ -356,75 +385,60 @@ def parse_tabular_risks(file_bytes: bytes, file_name: str, default_residual: int
     risks = []
     for i in range(header_row + 1, min(header_row + 100, len(df))):
         risk_text = str(df.iat[i, risk_col]) if df.shape[1] > risk_col else ""
-        if not risk_text or len(risk_text) < 15 or risk_text == "nan" or is_metadata(risk_text):
+        if not risk_text or risk_text == "nan" or len(risk_text) < 15:
             continue
-        
-        impact_score = None
-        if impact_col and df.shape[1] > impact_col:
-            impact_val = str(df.iat[i, impact_col])
-            impact_score = parse_risk_score(impact_val)
-        
-        likelihood_score = None
-        if likelihood_col and df.shape[1] > likelihood_col:
-            likelihood_val = str(df.iat[i, likelihood_col])
-            likelihood_score = parse_risk_score(likelihood_val)
-        
-        residual = default_residual
-        if impact_score and likelihood_score:
-            residual = min(25, max(1, (impact_score * likelihood_score) / 5))
-        
-        owner = "Not assigned"
-        if owner_col and df.shape[1] > owner_col:
-            owner_val = str(df.iat[i, owner_col])
-            if owner_val and owner_val != "nan":
-                owner = owner_val
+        if is_metadata(risk_text):
+            continue
         
         risks.append({
             "division": clean_division_name(file_name),
             "division_confidence": 0.7,
-            "division_source": "tabular",
+            "division_source": "tabular_fallback",
             "risk_name": risk_text[:50],
             "risk_statement": risk_text[:500],
             "category": "Uncategorised",
-            "residual_score": residual,
-            "inherent_score": min(25, residual + 3),
-            "owner": owner,
+            "residual_score": default_residual,
+            "inherent_score": min(25, default_residual + 3),
+            "owner": "Not assigned",
             "status": "Active",
             "due_date": None,
             "control_effectiveness": "Not rated",
-            "impact_score": impact_score,
-            "likelihood_score": likelihood_score,
+            "impact_score": None,
+            "likelihood_score": None,
         })
     
     if risks:
-        return pd.DataFrame(risks), {"extracted": len(risks), "method": "tabular"}
+        return pd.DataFrame(risks), {"extracted": len(risks), "method": "tabular_fallback"}
     return pd.DataFrame(), {"error": "No risks found"}
 
 # =============================================================================
 # MAIN DISPATCHER
 # =============================================================================
 def parse_uploaded_file_bytes(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    # Primary: Gemini extraction
+    # Use Gemini if forced
     if GEMINI_AVAILABLE and st.session_state.force_gemini:
+        st.info("🚀 Force Gemini mode enabled - using AI extraction")
         df, debug = gemini_extract_risks(file_bytes, file_name, default_residual)
         if not df.empty:
             return df, debug
+        else:
+            st.warning(f"Gemini extraction failed: {debug.get('error', 'Unknown')}. Falling back to tabular parser.")
     
-    # Fallback: Tabular parser
-    df, debug = parse_tabular_risks(file_bytes, file_name, default_residual)
-    if not df.empty:
-        return df, debug
-    
-    return pd.DataFrame(), {"error": "No risks could be extracted"}
+    # Fallback to tabular
+    return parse_tabular_risks(file_bytes, file_name, default_residual)
 
 def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[pd.DataFrame, List[Dict]]:
     all_risks = []
     all_debug = []
     for file in uploaded_files:
+        st.write(f"📄 Processing: {file.name}")
         df, debug = cached_parse_file(file.getvalue(), file.name, default_residual)
         all_debug.append(debug)
         if not df.empty:
             all_risks.append(df)
+            st.write(f"   ✅ Extracted {len(df)} risks")
+        else:
+            st.write(f"   ❌ No risks extracted: {debug.get('error', 'Unknown')}")
     if not all_risks:
         return pd.DataFrame(), all_debug
     df_all = pd.concat(all_risks, ignore_index=True)
@@ -912,10 +926,9 @@ def render_parser_audit_panel():
         with st.expander("🔍 Parser Audit & Diagnostics", expanded=False):
             st.markdown("**Ingestion Confidence Report**")
             audit = st.session_state.parser_audit
-            col1, col2, col3 = st.columns(3)
+            col1, col2 = st.columns(2)
             col1.metric("Files Processed", audit.get("total_files", 0))
-            col2.metric("Unique Risks", audit.get("total_risks", 0))
-            col3.metric("Total Extracted", audit.get("total_risks", 0))
+            col2.metric("Total Risks", audit.get("total_risks", 0))
 
 def render_sidebar():
     with st.sidebar:
@@ -1040,7 +1053,7 @@ def main():
     if GEMINI_AVAILABLE:
         st.success("✅ Gemini API is configured and ready")
     else:
-        st.error("❌ Gemini API key not found")
+        st.error("❌ Gemini API key not found. Please add GEMINI_API_KEY to your secrets.toml")
     
     if st.session_state.tier == "free":
         st.info("🔓 Free tier: 1 file, preview only. Upgrade for full features.")
