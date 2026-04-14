@@ -171,19 +171,34 @@ def parse_risk_score(val: Any) -> Optional[float]:
     return None
 
 # =============================================================================
-# DIRECT PARSER FOR HR RISK REGISTER
+# DIRECT PARSER FOR HR RISK REGISTER (WITH DEBUGGING)
 # =============================================================================
 def parse_hr_risk_register(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
     """Direct parser for the HR Risk Register format."""
+    debug_info = {}
+    
     try:
         wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
         
         if "consolidated risk register" not in wb.sheetnames:
-            return pd.DataFrame(), {"error": "Sheet 'consolidated risk register' not found"}
+            debug_info["error"] = "Sheet 'consolidated risk register' not found"
+            debug_info["available_sheets"] = list(wb.sheetnames)
+            return pd.DataFrame(), debug_info
         
         ws = wb["consolidated risk register"]
         
-        # Find header row
+        # Print first few rows for debugging
+        debug_rows = []
+        for row_idx in range(1, min(20, ws.max_row + 1)):
+            row_data = []
+            for col_idx in range(1, min(15, ws.max_column + 1)):
+                val = ws.cell(row=row_idx, column=col_idx).value
+                if val:
+                    row_data.append(str(val)[:50])
+            debug_rows.append(f"Row {row_idx}: {', '.join(row_data)}")
+        debug_info["first_rows"] = debug_rows
+        
+        # Find header row - look for row containing "RISK DESCRIPTION"
         header_row_idx = None
         risk_desc_col = None
         risk_name_col = None
@@ -191,36 +206,47 @@ def parse_hr_risk_register(file_bytes: bytes, file_name: str, default_residual: 
         likelihood_col = None
         owner_col = None
         
-        for row_idx in range(1, min(10, ws.max_row + 1)):
-            for col_idx in range(1, min(20, ws.max_column + 1)):
+        for row_idx in range(1, min(20, ws.max_row + 1)):
+            for col_idx in range(1, min(30, ws.max_column + 1)):
                 val = ws.cell(row=row_idx, column=col_idx).value
-                if val and "risk description" in str(val).lower():
+                if val and isinstance(val, str) and "RISK DESCRIPTION" in val.upper():
                     header_row_idx = row_idx
+                    debug_info["header_row_found"] = row_idx
                     break
             if header_row_idx:
                 break
         
         if header_row_idx is None:
-            return pd.DataFrame(), {"error": "Could not find header row"}
+            debug_info["error"] = "Could not find header row with 'RISK DESCRIPTION'"
+            return pd.DataFrame(), debug_info
         
         # Find column indices
         for col_idx in range(1, min(30, ws.max_column + 1)):
             val = ws.cell(row=header_row_idx, column=col_idx).value
-            if val:
-                val_lower = str(val).lower()
-                if "risk description" in val_lower:
+            if val and isinstance(val, str):
+                val_upper = val.upper()
+                if "RISK DESCRIPTION" in val_upper:
                     risk_desc_col = col_idx
-                elif "risk name" in val_lower or "name" in val_lower:
+                elif "RISK NAME" in val_upper or "NAME" in val_upper:
                     risk_name_col = col_idx
-                elif "impact" in val_lower and "likelihood" not in val_lower:
+                elif "IMPACT" in val_upper and "LIKELIHOOD" not in val_upper:
                     impact_col = col_idx
-                elif "likelihood" in val_lower:
+                elif "LIKELIHOOD" in val_upper:
                     likelihood_col = col_idx
-                elif "owner" in val_lower:
+                elif "OWNER" in val_upper:
                     owner_col = col_idx
         
+        debug_info["columns_found"] = {
+            "risk_desc_col": risk_desc_col,
+            "risk_name_col": risk_name_col,
+            "impact_col": impact_col,
+            "likelihood_col": likelihood_col,
+            "owner_col": owner_col,
+        }
+        
         if risk_desc_col is None:
-            return pd.DataFrame(), {"error": "Risk description column not found"}
+            debug_info["error"] = "Risk description column not found"
+            return pd.DataFrame(), debug_info
         
         # Extract risks
         risks = []
@@ -229,6 +255,8 @@ def parse_hr_risk_register(file_bytes: bytes, file_name: str, default_residual: 
             if not risk_text:
                 continue
             risk_text = str(risk_text).strip()
+            
+            debug_info[f"row_{row_idx}_risk_text"] = risk_text[:100] if len(risk_text) > 100 else risk_text
             
             if len(risk_text) < 15:
                 continue
@@ -302,13 +330,130 @@ def parse_hr_risk_register(file_bytes: bytes, file_name: str, default_residual: 
                 "likelihood_score": likelihood_score,
             })
         
+        debug_info["risks_extracted"] = len(risks)
+        
         if risks:
-            return pd.DataFrame(risks), {"extracted": len(risks), "method": "direct_hr_parser"}
+            return pd.DataFrame(risks), debug_info
         else:
-            return pd.DataFrame(), {"error": "No risks found in consolidated register"}
+            debug_info["error"] = "No valid risks found in consolidated register"
+            return pd.DataFrame(), debug_info
             
     except Exception as e:
-        return pd.DataFrame(), {"error": f"HR parser failed: {str(e)}"}
+        debug_info["error"] = f"HR parser failed: {str(e)}"
+        return pd.DataFrame(), debug_info
+
+# =============================================================================
+# SIMPLE PARSER - JUST READ ALL CELLS AND FIND RISK-LIKE TEXT
+# =============================================================================
+def simple_fallback_parser(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    """Ultra-simple parser: just find any cell with text > 20 chars that isn't metadata."""
+    risks = []
+    debug_info = {"cells_scanned": 0, "candidates_found": 0}
+    
+    try:
+        wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+        
+        for sheet_name in wb.sheetnames:
+            if sheet_name.lower() in ["boundaries", "impact", "likelihood", "effectiveness", "risk matrix"]:
+                continue
+            ws = wb[sheet_name]
+            
+            for row_idx in range(1, min(ws.max_row + 1, 200)):
+                for col_idx in range(1, min(ws.max_column + 1, 30)):
+                    val = ws.cell(row=row_idx, column=col_idx).value
+                    debug_info["cells_scanned"] += 1
+                    if val and isinstance(val, str):
+                        text = str(val).strip()
+                        if len(text) > 30 and not text.startswith("="):
+                            # Skip obvious metadata
+                            metadata_indicators = ["risk monitoring", "period of assessment", "department/ unit", 
+                                                  "description of control", "overall effectiveness", "control categorisation",
+                                                  "action plan", "residual risk", "risk strategy", "inherent risk",
+                                                  "risk owner", "impact rating", "likelihood rating", "root cause",
+                                                  "consequences", "start date", "target completion", "processed by",
+                                                  "approved by", "recommended by", "signature", "link to objective",
+                                                  "risk no", "division/ dept"]
+                            if not any(ind in text.lower() for ind in metadata_indicators):
+                                debug_info["candidates_found"] += 1
+                                risks.append({
+                                    "division": clean_division_name(file_name),
+                                    "division_confidence": 0.6,
+                                    "division_source": "simple_fallback",
+                                    "risk_name": text[:50],
+                                    "risk_statement": text[:500],
+                                    "category": "Uncategorised",
+                                    "residual_score": default_residual,
+                                    "inherent_score": min(25, default_residual + 3),
+                                    "owner": "Not assigned",
+                                    "status": "Active",
+                                    "due_date": None,
+                                    "control_effectiveness": "Not rated",
+                                    "impact_score": None,
+                                    "likelihood_score": None,
+                                })
+                                if len(risks) >= 20:  # Limit to 20 risks
+                                    break
+                if len(risks) >= 20:
+                    break
+            if len(risks) >= 20:
+                break
+    except Exception as e:
+        debug_info["error"] = str(e)
+    
+    if risks:
+        return pd.DataFrame(risks), debug_info
+    return pd.DataFrame(), debug_info
+
+# =============================================================================
+# MAIN PARSER DISPATCHER
+# =============================================================================
+def parse_uploaded_file_bytes(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    # Priority 1: Direct HR parser
+    df, debug = parse_hr_risk_register(file_bytes, file_name, default_residual)
+    if not df.empty:
+        return df, debug
+    
+    # Priority 2: Simple fallback parser
+    df, debug = simple_fallback_parser(file_bytes, file_name, default_residual)
+    if not df.empty:
+        st.warning(f"⚠️ Used simple fallback parser - extracted {len(df)} potential risks. Some may be inaccurate.")
+        return df, debug
+    
+    # Priority 3: Gemini extraction
+    if GEMINI_AVAILABLE and st.session_state.force_gemini:
+        df, debug = gemini_extract_risks(file_bytes, file_name, default_residual)
+        if not df.empty:
+            return df, debug
+    
+    return pd.DataFrame(), {"error": "No risks could be extracted"}
+
+def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[pd.DataFrame, List[Dict]]:
+    all_risks = []
+    all_debug = []
+    for file in uploaded_files:
+        st.write(f"📄 Processing: {file.name}")
+        df, debug = cached_parse_file(file.getvalue(), file.name, default_residual)
+        all_debug.append(debug)
+        if not df.empty:
+            all_risks.append(df)
+            st.write(f"   ✅ Extracted {len(df)} risks")
+        else:
+            st.write(f"   ❌ No risks extracted")
+            if st.session_state.debug_mode:
+                st.json(debug)
+    if not all_risks:
+        return pd.DataFrame(), all_debug
+    df_all = pd.concat(all_risks, ignore_index=True)
+    df_all, _ = detect_semantic_duplicates(df_all, threshold=0.85)
+    df_all["residual_level"] = df_all["residual_score"].apply(lambda x: "Critical" if x >= 20 else "High" if x >= 12 else "Medium" if x >= 6 else "Low")
+    if tier == "free":
+        df_all = df_all.head(10)
+    st.session_state.parser_audit = {"total_files": len(uploaded_files), "total_risks": len(df_all)}
+    return df_all, all_debug
+
+@st.cache_data
+def cached_parse_file(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    return parse_uploaded_file_bytes(file_bytes, file_name, default_residual)
 
 # =============================================================================
 # GEMINI EXTRACTION (FALLBACK)
@@ -391,41 +536,6 @@ Content:
         
     except Exception as e:
         return pd.DataFrame(), {"error": f"Gemini failed: {str(e)}"}
-
-# =============================================================================
-# MAIN PARSER DISPATCHER
-# =============================================================================
-def parse_uploaded_file_bytes(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    # Priority 1: Direct HR parser
-    df, debug = parse_hr_risk_register(file_bytes, file_name, default_residual)
-    if not df.empty:
-        return df, debug
-    
-    # Priority 2: Gemini extraction
-    if GEMINI_AVAILABLE and st.session_state.force_gemini:
-        df, debug = gemini_extract_risks(file_bytes, file_name, default_residual)
-        if not df.empty:
-            return df, debug
-    
-    return pd.DataFrame(), {"error": "No risks could be extracted"}
-
-def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[pd.DataFrame, List[Dict]]:
-    all_risks = []
-    all_debug = []
-    for file in uploaded_files:
-        df, debug = cached_parse_file(file.getvalue(), file.name, default_residual)
-        all_debug.append(debug)
-        if not df.empty:
-            all_risks.append(df)
-    if not all_risks:
-        return pd.DataFrame(), all_debug
-    df_all = pd.concat(all_risks, ignore_index=True)
-    df_all, _ = detect_semantic_duplicates(df_all, threshold=0.85)
-    df_all["residual_level"] = df_all["residual_score"].apply(lambda x: "Critical" if x >= 20 else "High" if x >= 12 else "Medium" if x >= 6 else "Low")
-    if tier == "free":
-        df_all = df_all.head(10)
-    st.session_state.parser_audit = {"total_files": len(uploaded_files), "total_risks": len(df_all)}
-    return df_all, all_debug
 
 # =============================================================================
 # SEMANTIC DUPLICATE DETECTION
@@ -975,7 +1085,7 @@ def render_sidebar():
                     st.session_state.category_appetite[cat] = new_val
         st.session_state.primary_color = st.color_picker("Primary Color", st.session_state.primary_color)
         st.session_state.secondary_color = st.color_picker("Secondary Color", st.session_state.secondary_color)
-        st.checkbox("🔧 Debug Mode", key="debug_mode")
+        st.checkbox("🔧 Debug Mode (show parser details)", key="debug_mode")
         if GEMINI_AVAILABLE:
             st.checkbox("🤖 Force Gemini Extraction", key="force_gemini", value=True)
 
