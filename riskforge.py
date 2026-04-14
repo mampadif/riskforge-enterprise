@@ -172,9 +172,6 @@ def detect_division_with_confidence(df: pd.DataFrame, file_name: str, row: pd.Se
         source = "filename"
         return division, confidence, source
     
-    # Source 3: Worksheet/sheet name (if available via parsing context)
-    # This would need to be passed from parse_excel_file_bytes
-    
     return division, confidence, source
 
 # =============================================================================
@@ -648,7 +645,7 @@ def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[p
         "total_filtered_header": total_filtered_header,
         "total_filtered_short": total_filtered_short,
         "unique_risks": unique_risk_count,
-        "division_confidence": "Mixed"  # Will be refined later
+        "division_confidence": "Mixed"
     }
     st.session_state.parser_audit = audit_summary
     
@@ -1105,7 +1102,6 @@ def apply_custom_theme(primary: str, secondary: str) -> None:
     .metric-label {{ font-size:0.8rem; color:#6B7A8A; }}
     .metric-value {{ font-size:1.8rem; font-weight:800; color:#12384D; }}
     .stButton > button {{ background: var(--p-color) !important; color:white !important; border-radius:10px !important; }}
-    .hero-header {{ background: linear-gradient(135deg, {primary}, {secondary}); padding:1.5rem; border-radius:20px; color:white; margin-bottom:1rem; }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -1138,8 +1134,23 @@ def render_sidebar():
         if st.session_state.tier == "free":
             st.markdown("---")
             st.markdown("### 🚀 Upgrade")
-            st.markdown("**Professional** – $29/mo or $99/yr\n- Full board pack\n- AI briefing\n- Heatmaps\n- Category/Division charts")
-            st.markdown("**Enterprise** – $99/mo or $299/yr\n- Branded PDF board pack\n- Committee-ready exports\n- White-label reports\n- Priority support\n- Custom appetite thresholds")
+            
+            # IMPROVED PRICING SECTION: prices placed after plan names, no redundant tables
+            st.markdown("""
+**Professional** – $29/month or $99/year  
+- Full board pack  
+- AI briefing  
+- Heatmaps  
+- Category/Division charts  
+
+**Enterprise** – $99/month or $299/year  
+- Branded PDF board pack  
+- Committee-ready exports  
+- White-label reports  
+- Priority support  
+- Custom appetite thresholds  
+""")
+            
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("Pro Monthly $29"):
@@ -1223,21 +1234,51 @@ def main():
     apply_custom_theme(st.session_state.primary_color, st.session_state.secondary_color)
     render_sidebar()
     
+    # =========================================================================
+    # ENTERPRISE-GRADE HERO BANNER (CSS class-based, reliable)
+    # =========================================================================
+    st.markdown("""
+    <style>
+    .riskforge-hero {
+        background: linear-gradient(135deg, #173a5e, #1e5c7a);
+        padding: 28px 36px;
+        border-radius: 18px;
+        margin-bottom: 24px;
+        color: white;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+    }
+    .riskforge-hero-title {
+        font-size: 1.9rem;
+        font-weight: 800;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
+    .riskforge-hero-subtitle {
+        font-size: 1rem;
+        opacity: 0.85;
+        margin-top: 6px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Get organization name from session state
+    org_name = st.session_state.get("org_name", "Your Organisation")
+    report_title = st.session_state.get("report_title", "Enterprise Risk Overview")
+    
+    # Display logo if available
+    logo_html = ""
     if st.session_state.logo_bytes:
         b64 = base64.b64encode(st.session_state.logo_bytes).decode()
-        logo_html = f'<img src="data:image/png;base64,{b64}" style="height:50px; margin-right:15px;" />'
-    else:
-        logo_html = ""
+        logo_html = f'<img src="data:image/png;base64,{b64}" style="height:45px; width:auto; border-radius:8px;" />'
     
     st.markdown(f"""
-    <div class="hero-header">
-        <div style="display:flex; align-items:center;">
+    <div class="riskforge-hero">
+        <div class="riskforge-hero-title">
             {logo_html}
-            <div>
-                <div style="font-size:1.8rem; font-weight:800;">{st.session_state.org_name}</div>
-                <div>{st.session_state.report_title}</div>
-            </div>
+            <span>🛡️ {org_name}</span>
         </div>
+        <div class="riskforge-hero-subtitle">{report_title}</div>
     </div>
     """, unsafe_allow_html=True)
     
