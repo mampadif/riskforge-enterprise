@@ -309,25 +309,39 @@ def infer_category_from_text(title: str, statement: str, cause: str, raw_categor
     return "Operational"
 
 # =============================================================================
-# SHEET / HEADER DISCOVERY
+# SHEET / HEADER DISCOVERY (EXPANDED FOR MONITORING SHEETS)
 # =============================================================================
 FIELD_PATTERNS: Dict[str, List[str]] = {
     "risk_no": [r"risk\s*no", r"risk\s*id", r"identifier"],
     "objective": [r"link\s*to\s*objective", r"objective"],
-    "risk_name": [r"risk\s*description", r"risk\s*title", r"risk\s*name"],
-    "risk_statement": [r"risk\s*definition", r"statement", r"risk\s*event"],
+    "risk_name": [
+        r"risk\s*description",
+        r"risk\s*title",
+        r"risk\s*name",
+        r"name\s*of\s*risk",
+        r"^risk$",
+        r"key\s*risk",
+    ],
+    "risk_statement": [
+        r"risk\s*definition",
+        r"statement",
+        r"risk\s*event",
+        r"risk\s*detail",
+        r"risk\s*narrative",
+        r"description\s*of\s*risk",
+    ],
     "cause": [r"cause", r"root\s*cause"],
     "category": [r"risk\s*category", r"category", r"type\s*of\s*risk"],
-    "impact_text": [r"impact"],
-    "likelihood_text": [r"likelihood"],
+    "impact_text": [r"impact", r"severity"],
+    "likelihood_text": [r"likelihood", r"probability"],
     "inherent_text": [r"inherent\s*risk", r"inherent"],
     "residual_text": [r"residual\s*risk", r"residual"],
-    "controls": [r"controls", r"control\s*measure", r"existing\s*controls"],
+    "controls": [r"controls", r"control\s*measure", r"existing\s*controls", r"current\s*controls"],
     "control_effectiveness_text": [r"control\s*effectiveness", r"effectiveness"],
-    "owner": [r"risk\s*owner", r"owner", r"accountable"],
+    "owner": [r"risk\s*owner", r"owner", r"accountable", r"action\s*owner"],
     "strategy": [r"risk\s*strategy", r"strategy", r"response"],
-    "treatment": [r"risk\s*treatment", r"action\s*plan", r"mitigation", r"treatment"],
-    "status": [r"status", r"progress"],
+    "treatment": [r"risk\s*treatment", r"action\s*plan", r"mitigation", r"treatment", r"management\s*action"],
+    "status": [r"status", r"progress", r"quarter\s*status", r"update\s*status"],
     "due_date": [r"treatment\s*due\s*date", r"due\s*date", r"target\s*date", r"completion\s*date"],
 }
 
@@ -335,7 +349,8 @@ def is_helper_sheet(sheet_name: str) -> bool:
     s = sheet_name.lower()
     helper_keywords = [
         "boundary", "impact", "likelihood", "effectiveness", "matrix", "lookup",
-        "legend", "instruction", "guide", "summary", "dashboard", "heatmap", "chart", "pivot",
+        "legend", "instruction", "guide", "dashboard", "heatmap", "chart", "pivot",
+        # "summary" removed because quarterly monitoring sheets often use it
     ]
     return any(word in s for word in helper_keywords)
 
@@ -382,9 +397,9 @@ def rank_candidate_sheets(wb) -> List[Dict[str, Any]]:
         if "register" in lower_name:
             name_bonus += 3
         if "monitor" in lower_name:
-            name_bonus += 1
+            name_bonus += 2
         if "quarter" in lower_name:
-            name_bonus += 1
+            name_bonus += 2
         if is_helper_sheet(sheet_name):
             name_bonus -= 4
 
@@ -638,7 +653,7 @@ def parse_structured_sheet(
     return pd.DataFrame(risks), debug
 
 # =============================================================================
-# UNIVERSAL PARSER ENTRY POINT
+# UNIVERSAL PARSER ENTRY POINT (PARSES UP TO 3 SHEETS)
 # =============================================================================
 def parse_structured_risk_register(
     file_bytes: bytes,
@@ -646,9 +661,9 @@ def parse_structured_risk_register(
     default_residual: int
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     debug_info: Dict[str, Any] = {
-        "parser": "universal_structured_register_v1",
+        "parser": "universal_structured_register_v2",
         "candidate_sheets": [],
-        "selected_sheet": None,
+        "selected_sheets": [],
         "error": None,
     }
 
@@ -658,10 +673,13 @@ def parse_structured_risk_register(
         candidates = rank_candidate_sheets(wb)
         debug_info["candidate_sheets"] = candidates[:10]
 
+        # Relaxed criteria: header score >= 2, at least 4 columns mapped,
+        # and must contain risk_name or risk_statement
         strong_candidates = [
             c for c in candidates
             if c["header_row"] is not None
-            and c["header_score"] >= 4
+            and c["header_score"] >= 2
+            and len(c["column_map"]) >= 4
             and ("risk_name" in c["column_map"] or "risk_statement" in c["column_map"])
         ]
 
@@ -669,25 +687,33 @@ def parse_structured_risk_register(
             debug_info["error"] = "No structured risk register sheet detected"
             return pd.DataFrame(), debug_info
 
-        best = strong_candidates[0]
-        debug_info["selected_sheet"] = best["sheet_name"]
+        # Parse the top 3 strong candidates and combine results
+        all_dfs = []
+        for idx, candidate in enumerate(strong_candidates[:3]):
+            sheet_name = candidate["sheet_name"]
+            debug_info["selected_sheets"].append(sheet_name)
 
-        ws = wb[best["sheet_name"]]
-        df, parse_debug = parse_structured_sheet(
-            ws=ws,
-            sheet_name=best["sheet_name"],
-            col_map=best["column_map"],
-            header_row=best["header_row"],
-            file_name=file_name,
-            default_residual=default_residual,
-        )
+            ws = wb[sheet_name]
+            df_sheet, parse_debug = parse_structured_sheet(
+                ws=ws,
+                sheet_name=sheet_name,
+                col_map=candidate["column_map"],
+                header_row=candidate["header_row"],
+                file_name=file_name,
+                default_residual=default_residual,
+            )
+            if not df_sheet.empty:
+                all_dfs.append(df_sheet)
+            if idx == 0:
+                debug_info.update(parse_debug)
 
-        debug_info.update(parse_debug)
+        if all_dfs:
+            combined_df = pd.concat(all_dfs, ignore_index=True)
+            combined_df = combined_df.drop_duplicates(subset=["risk_statement", "risk_name"], keep="first")
+            debug_info["total_risks_found"] = len(combined_df)
+            return combined_df, debug_info
 
-        if not df.empty:
-            return df, debug_info
-
-        debug_info["error"] = "Structured sheet detected but no risks parsed"
+        debug_info["error"] = "Structured sheets detected but no risks parsed"
         return pd.DataFrame(), debug_info
 
     except Exception as exc:
@@ -773,7 +799,7 @@ def simple_fallback_parser(
     return pd.DataFrame(), debug_info
 
 # =============================================================================
-# GEMINI FALLBACK (unchanged)
+# GEMINI FALLBACK
 # =============================================================================
 def gemini_extract_risks(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
     if not GEMINI_AVAILABLE:
@@ -886,7 +912,7 @@ def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[p
     return df_all, all_debug
 
 # =============================================================================
-# SEMANTIC DUPLICATE DETECTION (unchanged)
+# SEMANTIC DUPLICATE DETECTION
 # =============================================================================
 def normalize_for_dedupe(text: str) -> str:
     if not isinstance(text, str):
@@ -940,7 +966,7 @@ def detect_semantic_duplicates(df: pd.DataFrame, threshold: float = 0.85) -> Tup
     return deduped, duplicates_df
 
 # =============================================================================
-# AI FUNCTIONS (unchanged)
+# AI FUNCTIONS
 # =============================================================================
 def ai_infer_category(statement: str, fallback: str = "Uncategorised") -> str:
     categories = ["Strategic", "Financial", "Operational", "ICT/Cyber", "Compliance/Legal", "People/HR", "Health/Safety", "Reputational", "Environmental"]
@@ -972,7 +998,7 @@ Be concise, actionable."""
         return ""
 
 # =============================================================================
-# INTELLIGENCE ENGINE (unchanged)
+# INTELLIGENCE ENGINE
 # =============================================================================
 def calculate_weighted_treatment_confidence(row: pd.Series) -> float:
     score = 0.0
@@ -1154,7 +1180,7 @@ def generate_board_narrative(snapshot: Dict, comparison: Dict, threshold: int, c
     return "\n".join(narrative)
 
 # =============================================================================
-# EXCEL & PDF EXPORTS (unchanged)
+# EXCEL & PDF EXPORTS
 # =============================================================================
 def style_excel_with_risk_colors(wb):
     level_colors = {
@@ -1272,7 +1298,7 @@ def generate_pdf_board_pack(narrative: str, snapshot: Dict, company: str, report
     return buffer.getvalue()
 
 # =============================================================================
-# DASHBOARD CHARTS (unchanged)
+# DASHBOARD CHARTS
 # =============================================================================
 def create_category_chart(df: pd.DataFrame) -> go.Figure:
     if df.empty:
@@ -1314,7 +1340,7 @@ def create_treatment_gauge(confidence: float) -> go.Figure:
     return fig
 
 # =============================================================================
-# UI COMPONENTS (unchanged)
+# UI COMPONENTS
 # =============================================================================
 def apply_custom_theme(primary: str, secondary: str) -> None:
     st.markdown(f"""
@@ -1438,7 +1464,7 @@ def render_sidebar():
             st.checkbox("🤖 Force Gemini Extraction", key="force_gemini", value=True)
 
 # =============================================================================
-# MAIN APP (unchanged)
+# MAIN APP
 # =============================================================================
 def main():
     apply_custom_theme(st.session_state.primary_color, st.session_state.secondary_color)
