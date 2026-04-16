@@ -309,7 +309,7 @@ def infer_category_from_text(title: str, statement: str, cause: str, raw_categor
     return "Operational"
 
 # =============================================================================
-# SHEET / HEADER DISCOVERY (EXPANDED FOR MONITORING SHEETS)
+# SHEET / HEADER DISCOVERY (EXPANDED)
 # =============================================================================
 FIELD_PATTERNS: Dict[str, List[str]] = {
     "risk_no": [r"risk\s*no", r"risk\s*id", r"identifier"],
@@ -350,7 +350,6 @@ def is_helper_sheet(sheet_name: str) -> bool:
     helper_keywords = [
         "boundary", "impact", "likelihood", "effectiveness", "matrix", "lookup",
         "legend", "instruction", "guide", "dashboard", "heatmap", "chart", "pivot",
-        # "summary" removed because quarterly monitoring sheets often use it
     ]
     return any(word in s for word in helper_keywords)
 
@@ -673,8 +672,6 @@ def parse_structured_risk_register(
         candidates = rank_candidate_sheets(wb)
         debug_info["candidate_sheets"] = candidates[:10]
 
-        # Relaxed criteria: header score >= 2, at least 4 columns mapped,
-        # and must contain risk_name or risk_statement
         strong_candidates = [
             c for c in candidates
             if c["header_row"] is not None
@@ -687,7 +684,6 @@ def parse_structured_risk_register(
             debug_info["error"] = "No structured risk register sheet detected"
             return pd.DataFrame(), debug_info
 
-        # Parse the top 3 strong candidates and combine results
         all_dfs = []
         for idx, candidate in enumerate(strong_candidates[:3]):
             sheet_name = candidate["sheet_name"]
@@ -1598,20 +1594,385 @@ def main():
             st.subheader("Risk Appetite Status")
             st.progress(data.get("pct_within_appetite", 0) / 100)
             st.caption(f"Within: {data.get('pct_within_appetite', 0)}% | Near: {data.get('pct_near_appetite', 0)}% | Breached: {data.get('pct_breached', 0)}%")
+        
         with tab2:
             st.subheader("Enterprise Risk Register")
-            st.dataframe(df, use_container_width=True)
+            # Add appetite breach highlighting
+            def highlight_appetite(row):
+                threshold = data.get("threshold", st.session_state.board_threshold)
+                category_appetite = st.session_state.category_appetite if st.session_state.tier == "enterprise" else {}
+                band = appetite_band(row["residual_score"], threshold, row.get("category", ""), category_appetite)
+                if band in ["breached", "critical breach"]:
+                    return ['background-color: #fee2e2'] * len(row)
+                elif band == "near appetite":
+                    return ['background-color: #fef3c7'] * len(row)
+                else:
+                    return [''] * len(row)
+            
+            styled_df = df.style.apply(highlight_appetite, axis=1)
+            st.dataframe(styled_df, use_container_width=True)
+        
         with tab3:
-            st.subheader("Board Intelligence Report")
+            # -----------------------------------------------------------------
+            # Premium Executive Board Pack Styling
+            # -----------------------------------------------------------------
+            st.markdown("""
+            <style>
+            .exec-card {
+                background: #ffffff;
+                border-radius: 20px;
+                padding: 22px 24px;
+                box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
+                border: 1px solid rgba(14, 54, 92, 0.08);
+                margin-bottom: 20px;
+            }
+            .exec-card-header {
+                display: flex;
+                align-items: center;
+                margin-bottom: 18px;
+                border-bottom: 1px solid #eef2f6;
+                padding-bottom: 14px;
+            }
+            .exec-card-title {
+                font-size: 1.2rem;
+                font-weight: 700;
+                color: #0E365C;
+                letter-spacing: -0.01em;
+            }
+            .exec-badge {
+                display: inline-block;
+                padding: 6px 14px;
+                border-radius: 40px;
+                font-size: 0.8rem;
+                font-weight: 700;
+                letter-spacing: 0.2px;
+                text-transform: uppercase;
+            }
+            .exec-metric-row {
+                display: flex;
+                justify-content: space-between;
+                margin-bottom: 14px;
+            }
+            .exec-metric-label {
+                color: #475569;
+                font-size: 0.95rem;
+            }
+            .exec-metric-value {
+                font-weight: 700;
+                color: #0f172a;
+                font-size: 1.1rem;
+            }
+            .exec-divider {
+                height: 1px;
+                background: #e2e8f0;
+                margin: 18px 0;
+            }
+            .exec-risk-card {
+                background: #f8fafc;
+                border-radius: 16px;
+                padding: 16px 20px;
+                margin-bottom: 12px;
+                border-left: 6px solid;
+            }
+            .exec-hero {
+                background: linear-gradient(145deg, #0E365C 0%, #1A5F7A 100%);
+                border-radius: 28px;
+                padding: 28px 32px;
+                color: white;
+                margin-bottom: 24px;
+                box-shadow: 0 12px 32px rgba(14, 54, 92, 0.2);
+            }
+            .exec-ai-brief {
+                background: #f1f5f9;
+                border-radius: 18px;
+                padding: 20px 24px;
+                border-left: 8px solid #0E365C;
+                margin-bottom: 24px;
+            }
+            </style>
+            """, unsafe_allow_html=True)
+
+            health = data.get("enterprise_health_score", 0)
+            if health >= 80:
+                posture, posture_color, posture_bg = "Strong", "#10b981", "#d1fae5"
+            elif health >= 60:
+                posture, posture_color, posture_bg = "Stable", "#3b82f6", "#dbeafe"
+            elif health >= 40:
+                posture, posture_color, posture_bg = "Elevated", "#f59e0b", "#fef3c7"
+            else:
+                posture, posture_color, posture_bg = "Critical", "#ef4444", "#fee2e2"
+
+            st.markdown(f"""
+            <div class="exec-hero">
+                <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                    <div>
+                        <div style="font-size: 14px; opacity: 0.85; letter-spacing: 0.5px;">
+                            {data.get("company", st.session_state.org_name).upper()}
+                        </div>
+                        <div style="font-size: 36px; font-weight: 700; margin-top: 8px; line-height: 1.1;">
+                            {data.get("report_title", st.session_state.report_title)}
+                        </div>
+                        <div style="margin-top: 12px; font-size: 16px; opacity: 0.9;">
+                            {data.get("period", f"Q{((datetime.now().month-1)//3)+1} {datetime.now().year}")} • Board Date: {data.get("board_date", datetime.now().strftime('%B %d, %Y'))}
+                        </div>
+                    </div>
+                    <div style="text-align: right;">
+                        <div style="font-size: 14px; opacity: 0.8;">ENTERPRISE HEALTH</div>
+                        <div style="font-size: 56px; font-weight: 800; line-height: 1;">{health}</div>
+                        <div style="background: {posture_bg}; color: {posture_color}; padding: 6px 16px; border-radius: 40px; font-weight: 700; font-size: 16px; margin-top: 8px; display: inline-block;">
+                            {posture} POSTURE
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
             if data.get("ai_summary"):
-                st.info(f"**AI Executive Summary:** {data['ai_summary']}")
-            st.markdown(data.get("narrative", "No narrative available"))
-            if data.get("emerging_themes"):
-                st.markdown("**Emerging Themes:** " + ", ".join(data["emerging_themes"]))
-            if data.get("board_risks"):
-                st.markdown("**Top Board-Attention Risks**")
-                for risk in data["board_risks"]:
-                    st.markdown(f"- **{risk['risk_name']}** – Residual: {risk['residual_score']}/25, Owner: {risk['owner']}")
+                st.markdown(f"""
+                <div class="exec-ai-brief">
+                    <div style="display: flex; align-items: center; margin-bottom: 12px;">
+                        <span style="font-size: 20px; margin-right: 10px;">🤖</span>
+                        <span style="font-weight: 700; font-size: 18px; color: #0E365C;">AI Executive Briefing</span>
+                    </div>
+                    <div style="font-size: 16px; color: #1e293b; line-height: 1.6;">
+                        {data['ai_summary']}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            col_left, col_right = st.columns([1.4, 1])
+
+            with col_left:
+                st.markdown(f"""
+                <div class="exec-card">
+                    <div class="exec-card-header">
+                        <span class="exec-card-title">📋 Executive Posture</span>
+                    </div>
+                    <div class="exec-metric-row">
+                        <span class="exec-metric-label">Total Risks in Register</span>
+                        <span class="exec-metric-value">{data['total_risks']}</span>
+                    </div>
+                    <div class="exec-metric-row">
+                        <span class="exec-metric-label">Critical + High Risks</span>
+                        <span class="exec-metric-value">{data['critical_count'] + data['high_count']}</span>
+                    </div>
+                    <div class="exec-metric-row">
+                        <span class="exec-metric-label">Average Residual Score</span>
+                        <span class="exec-metric-value">{data.get('avg_residual', 0):.1f} / 25</span>
+                    </div>
+                    <div class="exec-metric-row">
+                        <span class="exec-metric-label">Average Inherent Score</span>
+                        <span class="exec-metric-value">{data.get('avg_inherent', 0):.1f} / 25</span>
+                    </div>
+                    <div class="exec-divider"></div>
+                    <div class="exec-metric-row">
+                        <span class="exec-metric-label">Ownership Coverage</span>
+                        <span class="exec-metric-value">{data.get('ownership_coverage', 0)}%</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                comp = data.get("comparison", {})
+                if comp:
+                    movement_html = ""
+                    if comp.get("new_risks"):
+                        movement_html += f"""
+                        <div class="exec-metric-row">
+                            <span class="exec-metric-label">🆕 New Risks</span>
+                            <span class="exec-metric-value">{len(comp['new_risks'])}</span>
+                        </div>
+                        """
+                    if comp.get("closed_risks"):
+                        movement_html += f"""
+                        <div class="exec-metric-row">
+                            <span class="exec-metric-label">✅ Closed Risks</span>
+                            <span class="exec-metric-value">{len(comp['closed_risks'])}</span>
+                        </div>
+                        """
+                    if comp.get("worsened_risks"):
+                        movement_html += f"""
+                        <div class="exec-metric-row">
+                            <span class="exec-metric-label">📈 Worsened Risks</span>
+                            <span class="exec-metric-value">{len(comp['worsened_risks'])}</span>
+                        </div>
+                        """
+                    if comp.get("improved_risks"):
+                        movement_html += f"""
+                        <div class="exec-metric-row">
+                            <span class="exec-metric-label">📉 Improved Risks</span>
+                            <span class="exec-metric-value">{len(comp['improved_risks'])}</span>
+                        </div>
+                        """
+                    health_delta = comp.get("health_delta", 0)
+                    if health_delta != 0:
+                        delta_text = f"+{health_delta:.1f}" if health_delta > 0 else f"{health_delta:.1f}"
+                        movement_html += f"""
+                        <div class="exec-metric-row">
+                            <span class="exec-metric-label">Health Score Change</span>
+                            <span class="exec-metric-value">{delta_text} pts</span>
+                        </div>
+                        """
+                    appetite_delta = comp.get("appetite_delta", 0)
+                    if appetite_delta != 0:
+                        delta_text = f"+{appetite_delta:.1f}%" if appetite_delta > 0 else f"{appetite_delta:.1f}%"
+                        movement_html += f"""
+                        <div class="exec-metric-row">
+                            <span class="exec-metric-label">Appetite Breach Change</span>
+                            <span class="exec-metric-value">{delta_text}</span>
+                        </div>
+                        """
+
+                    if movement_html:
+                        st.markdown(f"""
+                        <div class="exec-card">
+                            <div class="exec-card-header">
+                                <span class="exec-card-title">📊 Movement Since Last Review</span>
+                            </div>
+                            {movement_html}
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                st.markdown(f"""
+                <div class="exec-card">
+                    <div class="exec-card-header">
+                        <span class="exec-card-title">🎯 Concentration Risk Areas</span>
+                    </div>
+                    <div class="exec-metric-row">
+                        <span class="exec-metric-label">Top Division Exposure</span>
+                        <span class="exec-metric-value">{data.get('top_division', 'N/A')}</span>
+                    </div>
+                    <div class="exec-metric-row">
+                        <span class="exec-metric-label">Percentage of Load</span>
+                        <span class="exec-metric-value">{data.get('top_division_pct', 0)}%</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with col_right:
+                within = data.get('pct_within_appetite', 0)
+                near = data.get('pct_near_appetite', 0)
+                breached = data.get('pct_breached', 0)
+
+                st.markdown(f"""
+                <div class="exec-card">
+                    <div class="exec-card-header">
+                        <span class="exec-card-title">⚖️ Risk Appetite Status</span>
+                    </div>
+                    <div style="margin-bottom: 16px;">
+                        <div style="display: flex; align-items: center; margin-bottom: 10px;">
+                            <div style="width: 12px; height: 12px; border-radius: 4px; background: #10b981; margin-right: 10px;"></div>
+                            <span class="exec-metric-label" style="flex:1;">Within Appetite</span>
+                            <span class="exec-metric-value">{within}%</span>
+                        </div>
+                        <div style="display: flex; align-items: center; margin-bottom: 10px;">
+                            <div style="width: 12px; height: 12px; border-radius: 4px; background: #f59e0b; margin-right: 10px;"></div>
+                            <span class="exec-metric-label" style="flex:1;">Near Appetite</span>
+                            <span class="exec-metric-value">{near}%</span>
+                        </div>
+                        <div style="display: flex; align-items: center;">
+                            <div style="width: 12px; height: 12px; border-radius: 4px; background: #ef4444; margin-right: 10px;"></div>
+                            <span class="exec-metric-label" style="flex:1;">Breached</span>
+                            <span class="exec-metric-value">{breached}%</span>
+                        </div>
+                    </div>
+                    <div class="exec-divider"></div>
+                    <div class="exec-metric-row">
+                        <span class="exec-metric-label">Global Threshold</span>
+                        <span class="exec-metric-value">{data.get('threshold', st.session_state.board_threshold)}/25</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                confidence = data.get('treatment_confidence', 0)
+                conf_color = "#10b981" if confidence >= 75 else "#f59e0b" if confidence >= 50 else "#ef4444"
+                st.markdown(f"""
+                <div class="exec-card">
+                    <div class="exec-card-header">
+                        <span class="exec-card-title">🛠️ Treatment Delivery Confidence</span>
+                    </div>
+                    <div style="text-align: center; margin: 10px 0;">
+                        <span style="font-size: 48px; font-weight: 800; color: {conf_color};">{confidence}%</span>
+                    </div>
+                    <div class="exec-metric-row">
+                        <span class="exec-metric-label">Ownership Coverage</span>
+                        <span class="exec-metric-value">{data.get('ownership_coverage', 0)}%</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                themes = data.get('emerging_themes', [])
+                if themes:
+                    themes_html = "".join([f'<span class="exec-badge" style="background:#e0e7ff; color:#3730a3; margin-right:8px; margin-bottom:8px;">{theme}</span>' for theme in themes])
+                    st.markdown(f"""
+                    <div class="exec-card">
+                        <div class="exec-card-header">
+                            <span class="exec-card-title">🔍 Emerging Systemic Themes</span>
+                        </div>
+                        <div style="margin-top: 8px;">
+                            {themes_html}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            st.markdown("""
+            <div style="margin-top: 24px;">
+                <div class="exec-card-header" style="margin-bottom: 16px;">
+                    <span class="exec-card-title" style="font-size: 1.4rem;">⚠️ Top 5 Board‑Attention Risks</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            board_risks = data.get('board_risks', [])
+            for risk in board_risks[:5]:
+                score = risk['residual_score']
+                if score >= 20:
+                    border_color = "#dc2626"
+                    score_bg = "#fee2e2"
+                    score_color = "#991b1b"
+                    level = "Critical"
+                elif score >= 12:
+                    border_color = "#ea580c"
+                    score_bg = "#ffedd5"
+                    score_color = "#9a3412"
+                    level = "High"
+                elif score >= 6:
+                    border_color = "#ca8a04"
+                    score_bg = "#fef9c3"
+                    score_color = "#854d0e"
+                    level = "Medium"
+                else:
+                    border_color = "#16a34a"
+                    score_bg = "#dcfce7"
+                    score_color = "#166534"
+                    level = "Low"
+
+                st.markdown(f"""
+                <div class="exec-risk-card" style="border-left-color: {border_color};">
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                        <div style="flex: 1;">
+                            <div style="font-size: 18px; font-weight: 700; color: #0E365C; margin-bottom: 6px;">
+                                {risk['risk_name']}
+                            </div>
+                            <div style="font-size: 14px; color: #475569; margin-bottom: 8px;">
+                                {risk['division']} • Owner: {risk['owner']} • Category: {risk.get('category', 'Uncategorised')}
+                            </div>
+                        </div>
+                        <div style="margin-left: 20px; text-align: center;">
+                            <div style="background: {score_bg}; color: {score_color}; padding: 8px 16px; border-radius: 20px; font-weight: 800; font-size: 20px;">
+                                {score}/25
+                            </div>
+                            <div style="font-size: 12px; font-weight: 600; margin-top: 4px; color: {border_color};">{level}</div>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            if not board_risks:
+                st.info("No board‑level risks identified in this submission.")
+
+            with st.expander("📄 View Full Board Narrative (Text Version)"):
+                st.markdown(data.get("narrative", "No narrative available"))
+
         with tab4:
             st.subheader("Quarter Comparison & Trends")
             if data.get("comparison"):
