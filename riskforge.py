@@ -145,330 +145,453 @@ def clean_division_name(filename: str) -> str:
     return name.title() if name else "Unknown Division"
 
 def parse_risk_score(val: Any) -> Optional[float]:
+    """Convert various text/number representations to a 1-5 numeric score."""
     if pd.isna(val):
         return None
     s = str(val).strip().lower()
-    if s in ["#n/a", "#value!", "#ref!", "#name?", "#num!", "#null!", "none", "nan", ""]:
+    if s in ["#n/a", "#value!", "#ref!", "#name?", "#num!", "#null!", "none", "nan", "", "0"]:
         return None
-    text_map = {
-        "low": 5.0, "medium": 10.0, "moderate": 10.0, "high": 15.0,
-        "very high": 20.0, "critical": 25.0, "extreme": 25.0,
-        "minor": 5.0, "major": 15.0, "severe": 20.0,
-        "almost certain": 20.0, "likely": 15.0, "possible": 10.0, "unlikely": 5.0, "rare": 5.0,
+    
+    # Direct text mappings from the Boundaries sheet
+    impact_map = {
+        "critical": 5, "major": 4, "moderate": 3, "significant": 2, "minor": 1
     }
-    if s in text_map:
-        return text_map[s]
+    likelihood_map = {
+        "almost certain": 5, "likely": 4, "moderate": 3, "unlikely": 2, "rare": 1
+    }
+    if s in impact_map:
+        return float(impact_map[s])
+    if s in likelihood_map:
+        return float(likelihood_map[s])
+    
+    # Try numeric extraction
     match = re.search(r'(\d+(?:\.\d+)?)', s)
     if match:
         num = float(match.group(1))
         if 1 <= num <= 5:
-            return num * 5
-        if 1 <= num <= 10:
-            return num * 2.5
-        if 1 <= num <= 25:
+            return num
+        elif 1 <= num <= 25:
+            return round(num / 5)
+    return None
+
+def parse_control_effectiveness(val: Any) -> Optional[int]:
+    """Convert control effectiveness text to numeric 1-5 scale (1=Very Good, 5=Unsatisfactory)."""
+    if pd.isna(val):
+        return None
+    s = str(val).strip().lower()
+    mapping = {
+        "very good": 1, "good": 2, "satisfactory": 3, "weak": 4, "unsatisfactory": 5
+    }
+    for key, num in mapping.items():
+        if key in s:
+            return num
+    match = re.search(r'(\d+)', s)
+    if match:
+        num = int(match.group(1))
+        if 1 <= num <= 5:
             return num
     return None
 
 # =============================================================================
-# DIRECT HR RISK REGISTER PARSER (SIMPLIFIED)
+# ENHANCED CELL VALUE EXTRACTION (HANDLES FORMULAS & MERGED CELLS)
+# =============================================================================
+def get_cell_value(ws, row: int, col: int) -> Any:
+    """
+    Safely retrieve a cell value from an openpyxl worksheet.
+    - Handles merged cells (returns top-left value).
+    - If data_only returns None but cell has a formula, try to extract a sensible
+      value from the formula string (e.g., a VLOOKUP reference).
+    - Returns None if nothing useful can be extracted.
+    """
+    cell = ws.cell(row=row, column=col)
+    
+    # Handle merged cells
+    if cell.coordinate in ws.merged_cells:
+        for merged_range in ws.merged_cells.ranges:
+            if cell.coordinate in merged_range:
+                # Get the top-left cell of the merged range
+                min_col, min_row, max_col, max_row = merged_range.bounds
+                cell = ws.cell(row=min_row, column=min_col)
+                break
+    
+    val = cell.value
+    
+    # If data_only gave us a string that looks like an error, treat as None
+    if isinstance(val, str) and val.startswith("#"):
+        val = None
+    
+    # If value is None, try to extract from formula
+    if val is None and cell.data_type == 'f':
+        formula = cell.value  # actually the formula string
+        if formula:
+            # Try to extract a reference like "Boundaries!$A$19:$B$24"
+            match = re.search(r'!(\$?[A-Z]+\$?\d+)', formula)
+            if match:
+                ref = match.group(1)
+                try:
+                    ref_cell = ws[ref]
+                    val = ref_cell.value
+                except:
+                    pass
+    return val
+
+def parse_risk_score_from_text(val: Any) -> Optional[float]:
+    """Enhanced score parser that also handles formula text like =VLOOKUP(...)."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if s.startswith("="):
+        num_match = re.search(r'\b(\d+(?:\.\d+)?)\b', s)
+        if num_match:
+            return float(num_match.group(1))
+        return None
+    return parse_risk_score(val)
+
+def parse_control_effectiveness_text(val: Any) -> Optional[int]:
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s.startswith("="):
+        num_match = re.search(r'\b([1-5])\b', s)
+        if num_match:
+            return int(num_match.group(1))
+        return None
+    return parse_control_effectiveness(val)
+
+def infer_category_from_text(text: str) -> str:
+    """Infer risk category based on keywords."""
+    t = text.lower()
+    if any(k in t for k in ["compliance", "regulation", "labour law", "employment act", "statute"]):
+        return "Compliance/Legal"
+    elif any(k in t for k in ["financial", "budget", "funding", "revenue"]):
+        return "Financial"
+    elif any(k in t for k in ["cyber", "data", "it", "information security", "hack"]):
+        return "ICT/Cyber"
+    elif any(k in t for k in ["staff", "employee", "turnover", "morale", "talent", "training", "development"]):
+        return "People/HR"
+    elif any(k in t for k in ["safety", "health", "injury", "accident", "she"]):
+        return "Health/Safety"
+    elif any(k in t for k in ["reputation", "brand"]):
+        return "Reputational"
+    elif any(k in t for k in ["operational", "process", "disruption"]):
+        return "Operational"
+    elif any(k in t for k in ["strategic", "mandate"]):
+        return "Strategic"
+    return "Uncategorised"
+
+# =============================================================================
+# ENHANCED DIRECT HR RISK REGISTER PARSER (SCANS ALL SHEETS)
 # =============================================================================
 def parse_hr_risk_register_direct(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    """Direct parser for HR Risk Register - no complex header detection."""
+    """
+    Robust parser that extracts risks from:
+    - The 'consolidated risk register' sheet (table format)
+    - Any sheet with 'Name of risk' marker (individual monitoring tool sheets)
+    Handles formulas, merged cells, and variable column positions.
+    """
     risks = []
-    debug_info = {"rows_checked": 0, "risks_found": 0, "error": None}
+    debug_info = {
+        "sheets_scanned": 0,
+        "rows_processed": 0,
+        "risks_found": 0,
+        "skipped_rows": [],
+        "errors": []
+    }
     
     try:
         wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
         
-        # Find the consolidated risk register sheet
-        if "consolidated risk register" not in wb.sheetnames:
-            debug_info["error"] = "Sheet 'consolidated risk register' not found"
-            return pd.DataFrame(), debug_info
-        
-        ws = wb["consolidated risk register"]
-        
-        # Known column positions from your HR file (1-indexed)
-        # Based on the file structure:
-        # Row 2 contains headers
-        # Risk descriptions are in column C (index 3)
-        # Impact is in column G (index 7)
-        # Likelihood is in column I (index 9)
-        # Owner is in column O (index 15)
-        
-        risk_col = 3  # Column C
-        impact_col = 7  # Column G
-        likelihood_col = 9  # Column I
-        owner_col = 15  # Column O
-        name_col = 2  # Column B (risk name/title)
-        
-        # Find the header row (where "RISK DESCRIPTION" is)
-        header_row = None
-        for row_idx in range(1, min(20, ws.max_row + 1)):
-            val = ws.cell(row=row_idx, column=risk_col).value
-            if val and isinstance(val, str) and "RISK DESCRIPTION" in val.upper():
-                header_row = row_idx
-                break
-        
-        if header_row is None:
-            debug_info["error"] = "Could not find header row with RISK DESCRIPTION"
-            return pd.DataFrame(), debug_info
-        
-        # Start reading from the row after header
-        start_row = header_row + 1
-        
-        for row_idx in range(start_row, min(start_row + 50, ws.max_row + 1)):
-            debug_info["rows_checked"] += 1
-            
-            # Get risk description
-            risk_text = ws.cell(row=row_idx, column=risk_col).value
-            if not risk_text:
-                continue
-            risk_text = str(risk_text).strip()
-            
-            # Skip empty or very short text
-            if len(risk_text) < 15:
-                continue
-            
-            # Skip if it's a formula string
-            if risk_text.startswith("="):
-                continue
-            
-            # Skip metadata rows
-            if risk_text.lower() in ["risk description", "nan", "none", ""]:
-                continue
-            
-            # Get risk name
-            risk_name = risk_text[:50]
-            name_val = ws.cell(row=row_idx, column=name_col).value
-            if name_val and str(name_val).strip() and len(str(name_val).strip()) > 3:
-                risk_name = str(name_val).strip()[:80]
-            
-            # Get impact score
-            impact_val = ws.cell(row=row_idx, column=impact_col).value
-            impact_score = parse_risk_score(impact_val)
-            
-            # Get likelihood score
-            likelihood_val = ws.cell(row=row_idx, column=likelihood_col).value
-            likelihood_score = parse_risk_score(likelihood_val)
-            
-            # Calculate residual
-            residual = default_residual
-            if impact_score and likelihood_score:
-                residual = min(25, max(1, (impact_score * likelihood_score) / 5))
-            elif impact_score:
-                residual = min(25, impact_score * 5)
-            elif likelihood_score:
-                residual = min(25, likelihood_score * 5)
-            
-            # Get owner
-            owner = "Not assigned"
-            owner_val = ws.cell(row=row_idx, column=owner_col).value
-            if owner_val and str(owner_val).strip() and str(owner_val).strip() != "nan":
-                owner = str(owner_val).strip()
-            
-            # Determine category
-            category = "People/HR"
-            risk_lower = risk_text.lower()
-            if any(term in risk_lower for term in ["compliance", "regulation", "labour law"]):
-                category = "Compliance/Legal"
-            elif any(term in risk_lower for term in ["financial", "budget"]):
-                category = "Financial"
-            elif any(term in risk_lower for term in ["operational", "process"]):
-                category = "Operational"
-            elif any(term in risk_lower for term in ["strategic"]):
-                category = "Strategic"
-            
-            risks.append({
-                "division": "Human Resources",
-                "division_confidence": 0.95,
-                "division_source": "direct_hr_parser",
-                "risk_name": risk_name,
-                "risk_statement": risk_text[:500],
-                "category": category,
-                "residual_score": residual,
-                "inherent_score": min(25, residual + 3),
-                "owner": owner,
-                "status": "Active",
-                "due_date": None,
-                "control_effectiveness": "Not rated",
-                "impact_score": impact_score,
-                "likelihood_score": likelihood_score,
-            })
-            debug_info["risks_found"] += 1
-        
-        if risks:
-            return pd.DataFrame(risks), debug_info
-        else:
-            debug_info["error"] = "No valid risks found in the sheet"
-            return pd.DataFrame(), debug_info
-            
-    except Exception as e:
-        debug_info["error"] = str(e)
-        return pd.DataFrame(), debug_info
-
-# =============================================================================
-# SIMPLE FALLBACK PARSER (SCAN ALL CELLS)
-# =============================================================================
-def simple_fallback_parser(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    """Ultra-simple parser: find any cell with text that looks like a risk."""
-    risks = []
-    debug_info = {"cells_scanned": 0, "risks_found": 0}
-    
-    try:
-        wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
-        
+        # ---- First, scan all sheets for the "Name of risk" pattern (monitoring tools) ----
         for sheet_name in wb.sheetnames:
-            if sheet_name.lower() in ["boundaries", "impact", "likelihood", "effectiveness", "risk matrix"]:
+            if sheet_name.lower() in ["boundaries", "impact", "likelihood", "effectiveness", "risk matrix", "sample mt"]:
                 continue
             ws = wb[sheet_name]
+            debug_info["sheets_scanned"] += 1
             
-            for row_idx in range(1, min(ws.max_row + 1, 200)):
-                for col_idx in range(1, min(ws.max_column + 1, 30)):
-                    val = ws.cell(row=row_idx, column=col_idx).value
-                    debug_info["cells_scanned"] += 1
-                    if val and isinstance(val, str):
-                        text = str(val).strip()
-                        if len(text) > 30 and not text.startswith("="):
-                            # Skip obvious metadata
-                            metadata_indicators = [
-                                "risk monitoring", "period of assessment", "department/ unit",
-                                "description of control", "overall effectiveness", "control categorisation",
-                                "action plan", "residual risk", "risk strategy", "inherent risk",
-                                "risk owner", "impact rating", "likelihood rating", "root cause",
-                                "consequences", "start date", "target completion", "processed by",
-                                "approved by", "recommended by", "signature", "link to objective",
-                                "risk no", "division/ dept", "human resources risk register"
-                            ]
-                            if not any(ind in text.lower() for ind in metadata_indicators):
-                                debug_info["risks_found"] += 1
-                                risks.append({
-                                    "division": clean_division_name(file_name),
-                                    "division_confidence": 0.6,
-                                    "division_source": "simple_fallback",
-                                    "risk_name": text[:50],
-                                    "risk_statement": text[:500],
-                                    "category": "Uncategorised",
-                                    "residual_score": default_residual,
-                                    "inherent_score": min(25, default_residual + 3),
-                                    "owner": "Not assigned",
-                                    "status": "Active",
-                                    "due_date": None,
-                                    "control_effectiveness": "Not rated",
-                                    "impact_score": None,
-                                    "likelihood_score": None,
-                                })
-                                if len(risks) >= 20:
-                                    break
-                if len(risks) >= 20:
+            # Strategy A: Find the cell containing "Name of risk"
+            name_of_risk_row = None
+            name_of_risk_col = None
+            for row_idx in range(1, min(30, ws.max_row + 1)):
+                for col_idx in range(1, min(20, ws.max_column + 1)):
+                    cell_val = get_cell_value(ws, row_idx, col_idx)
+                    if cell_val and isinstance(cell_val, str) and "name of risk" in cell_val.lower():
+                        name_of_risk_row = row_idx
+                        name_of_risk_col = col_idx
+                        break
+                if name_of_risk_row:
                     break
-            if len(risks) >= 20:
-                break
-    except Exception as e:
-        debug_info["error"] = str(e)
-    
-    if risks:
-        return pd.DataFrame(risks), debug_info
-    return pd.DataFrame(), debug_info
-
-# =============================================================================
-# GEMINI EXTRACTION (FALLBACK)
-# =============================================================================
-def gemini_extract_risks(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    if not GEMINI_AVAILABLE:
-        return pd.DataFrame(), {"error": "Gemini not available"}
-    
-    try:
-        xls = pd.ExcelFile(io.BytesIO(file_bytes))
-        all_content = []
+            
+            if name_of_risk_row:
+                # The risk name is usually in column H (8) on the same row
+                risk_name_cell = get_cell_value(ws, name_of_risk_row, 8)
+                if not risk_name_cell:
+                    continue
+                risk_name = str(risk_name_cell).strip()
+                if not risk_name or len(risk_name) < 3:
+                    continue
+                
+                # Find description: usually a few rows down in column H
+                risk_desc = ""
+                for r_offset in range(1, 5):
+                    desc_val = get_cell_value(ws, name_of_risk_row + r_offset, 8)
+                    if desc_val and len(str(desc_val).strip()) > 20:
+                        risk_desc = str(desc_val).strip()
+                        break
+                if not risk_desc:
+                    risk_desc = risk_name  # fallback
+                
+                # Impact and likelihood: search nearby rows
+                impact_score = None
+                likelihood_score = None
+                for r in range(name_of_risk_row, min(name_of_risk_row + 15, ws.max_row + 1)):
+                    for c in range(1, min(20, ws.max_column + 1)):
+                        val = get_cell_value(ws, r, c)
+                        if val and isinstance(val, str):
+                            if "impact rating:" in val.lower():
+                                imp_val = get_cell_value(ws, r, c + 1)
+                                impact_score = parse_risk_score_from_text(imp_val)
+                            elif "likelihood rating" in val.lower():
+                                like_val = get_cell_value(ws, r, c + 1)
+                                likelihood_score = parse_risk_score_from_text(like_val)
+                
+                # Control effectiveness
+                control_eff_text = "Not rated"
+                control_eff_numeric = None
+                for r in range(name_of_risk_row, min(name_of_risk_row + 20, ws.max_row + 1)):
+                    for c in range(1, min(20, ws.max_column + 1)):
+                        val = get_cell_value(ws, r, c)
+                        if val and isinstance(val, str) and "overall effectiveness" in val.lower():
+                            ctrl_val = get_cell_value(ws, r, c + 1)
+                            control_eff_numeric = parse_control_effectiveness_text(ctrl_val)
+                            control_eff_text = str(ctrl_val).strip() if ctrl_val else "Not rated"
+                            break
+                
+                # Owner
+                owner = "Not assigned"
+                for r in range(name_of_risk_row, min(name_of_risk_row + 20, ws.max_row + 1)):
+                    for c in range(1, min(20, ws.max_column + 1)):
+                        val = get_cell_value(ws, r, c)
+                        if val and isinstance(val, str) and "risk owner" in val.lower():
+                            own_val = get_cell_value(ws, r, c + 1)
+                            if own_val:
+                                owner = str(own_val).strip()
+                            break
+                
+                # Division inference
+                division = clean_division_name(file_name)
+                if "human" in sheet_name.lower() or "hr" in sheet_name.lower():
+                    division = "Human Resources"
+                elif "it" in sheet_name.lower() or "technologies" in sheet_name.lower():
+                    division = "Information Technology"
+                elif "r&p" in sheet_name.lower():
+                    division = "Research & Partnerships"
+                elif "f&o" in sheet_name.lower():
+                    division = "Finance & Operations"
+                elif "nrm" in sheet_name.lower():
+                    division = "Natural Resources"
+                elif "ceo" in sheet_name.lower():
+                    division = "Executive"
+                
+                # Inherent & residual
+                inherent = default_residual
+                if impact_score is not None and likelihood_score is not None:
+                    inherent = min(25, max(1, impact_score * likelihood_score))
+                elif impact_score is not None:
+                    inherent = min(25, impact_score * 5)
+                elif likelihood_score is not None:
+                    inherent = min(25, likelihood_score * 5)
+                
+                residual = inherent
+                if control_eff_numeric is not None:
+                    factor = control_eff_numeric / 5.0
+                    residual = round(inherent * factor)
+                
+                category = infer_category_from_text(risk_desc)
+                
+                risks.append({
+                    "division": division,
+                    "division_confidence": 0.95,
+                    "division_source": "monitoring_sheet_parser",
+                    "risk_name": risk_name[:80],
+                    "risk_statement": risk_desc[:500],
+                    "category": category,
+                    "residual_score": min(25, max(1, residual)),
+                    "inherent_score": min(25, max(1, inherent)),
+                    "owner": owner,
+                    "status": "Active",
+                    "due_date": None,
+                    "control_effectiveness": control_eff_text,
+                    "impact_score": impact_score,
+                    "likelihood_score": likelihood_score,
+                })
+                debug_info["risks_found"] += 1
         
-        for sheet in xls.sheet_names:
-            if sheet.lower() in ["boundaries", "impact", "likelihood", "effectiveness", "risk matrix"]:
+        # ---- Strategy B: Process the consolidated risk register table ----
+        for sheet_name in wb.sheetnames:
+            if "consolidated risk register" not in sheet_name.lower():
                 continue
-            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None)
-            sheet_str = f"\n[SHEET: {sheet}]\n"
-            for i in range(min(50, df.shape[0])):
-                row_vals = []
-                for j in range(min(20, df.shape[1])):
-                    val = df.iat[i, j]
-                    if pd.notna(val) and str(val).strip():
-                        row_vals.append(str(val).strip())
-                if row_vals:
-                    sheet_str += f"Row {i+1}: {' | '.join(row_vals)}\n"
-            all_content.append(sheet_str)
-        
-        content = "\n".join(all_content)
-        if len(content) > 8000:
-            content = content[:8000]
-        
-        prompt = f"""
-You are a risk extraction engine. Extract ALL risks as a JSON list.
-Each risk must have: risk_statement, risk_name, owner, residual_score (1-25).
-Do NOT extract metadata.
-
-Return ONLY valid JSON.
-
-Content:
-{content}
-"""
-        response = ai_model.generate_content(prompt)
-        text = response.text.strip()
-        
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        
-        data = json.loads(text)
-        risks = data.get("risks", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        
-        rows = []
-        for r in risks:
-            risk_statement = r.get("risk_statement", "")
-            if not risk_statement or len(risk_statement) < 15:
+            ws = wb[sheet_name]
+            debug_info["sheets_scanned"] += 1
+            
+            # Find header row (contains "RISK DESCRIPTION")
+            header_row = None
+            for row_idx in range(1, min(20, ws.max_row + 1)):
+                for col_idx in range(1, min(30, ws.max_column + 1)):
+                    val = get_cell_value(ws, row_idx, col_idx)
+                    if val and isinstance(val, str) and "risk description" in val.lower():
+                        header_row = row_idx
+                        break
+                if header_row:
+                    break
+            
+            if not header_row:
+                debug_info["errors"].append(f"Sheet '{sheet_name}' has no 'RISK DESCRIPTION' header")
                 continue
-            rows.append({
-                "division": clean_division_name(file_name),
-                "division_confidence": 0.8,
-                "division_source": "gemini",
-                "risk_name": r.get("risk_name", risk_statement[:50]),
-                "risk_statement": risk_statement[:500],
-                "category": "Uncategorised",
-                "residual_score": min(25, max(1, int(r.get("residual_score", default_residual)))),
-                "inherent_score": min(25, int(r.get("residual_score", default_residual)) + 3),
-                "owner": r.get("owner", "Not assigned"),
-                "status": "Active",
-                "due_date": None,
-                "control_effectiveness": "Not rated",
-                "impact_score": r.get("impact_score"),
-                "likelihood_score": r.get("likelihood_score"),
-            })
+            
+            # Identify columns by scanning header row
+            col_risk_name = None      # Column C (short name)
+            col_risk_desc = None      # Column D (full statement)
+            col_impact = None         # Column G
+            col_likelihood = None     # Column I
+            col_control = None        # Column N
+            col_owner = None          # Column O
+            
+            for c in range(1, min(30, ws.max_column + 1)):
+                hdr = get_cell_value(ws, header_row, c)
+                if not hdr or not isinstance(hdr, str):
+                    continue
+                hdr_low = hdr.lower()
+                if "risk description" in hdr_low and "(" in hdr:
+                    # This is column C (the short label)
+                    col_risk_name = c
+                elif "risk definition" in hdr_low or "risk statement" in hdr_low:
+                    # This is column D (the full statement)
+                    col_risk_desc = c
+                elif "impact" in hdr_low and "(" in hdr:
+                    col_impact = c
+                elif "likelihood" in hdr_low and "(" in hdr:
+                    col_likelihood = c
+                elif "control effectiveness" in hdr_low:
+                    col_control = c
+                elif "risk owner" in hdr_low:
+                    col_owner = c
+            
+            # Fallback: if we didn't find column D, try to infer from positions
+            if not col_risk_desc:
+                # Assume column D is right after column C
+                if col_risk_name:
+                    col_risk_desc = col_risk_name + 1
+                else:
+                    col_risk_desc = 4  # Default to column D
+            
+            if not col_risk_desc:
+                debug_info["errors"].append(f"Could not find risk description column in '{sheet_name}'")
+                continue
+            
+            # Process rows after header
+            for row_idx in range(header_row + 1, ws.max_row + 1):
+                debug_info["rows_processed"] += 1
+                
+                # Get risk name (short label from column C)
+                name_val = get_cell_value(ws, row_idx, col_risk_name) if col_risk_name else None
+                risk_name = str(name_val).strip() if name_val else ""
+                
+                # Get risk description (full statement from column D)
+                desc_val = get_cell_value(ws, row_idx, col_risk_desc) if col_risk_desc else None
+                if not desc_val:
+                    debug_info["skipped_rows"].append({
+                        "sheet": sheet_name,
+                        "row": row_idx,
+                        "reason": "Empty description cell"
+                    })
+                    continue
+                
+                desc_str = str(desc_val).strip()
+                # Skip only if completely empty or a header word
+                if not desc_str or desc_str.lower() in ["risk definition", "risk statement", "nan", "none"]:
+                    continue
+                # Do NOT skip based on length – Staff Turnover is a valid short name
+                
+                # If we didn't get a name from column C, fall back to first 50 chars of description
+                if not risk_name:
+                    risk_name = desc_str[:50]
+                
+                # Impact (column G)
+                impact_val = get_cell_value(ws, row_idx, col_impact) if col_impact else None
+                impact_score = parse_risk_score_from_text(impact_val)
+                
+                # Likelihood (column I)
+                likelihood_val = get_cell_value(ws, row_idx, col_likelihood) if col_likelihood else None
+                likelihood_score = parse_risk_score_from_text(likelihood_val)
+                
+                # Control effectiveness (column N)
+                control_val = get_cell_value(ws, row_idx, col_control) if col_control else None
+                control_eff_numeric = parse_control_effectiveness_text(control_val)
+                control_eff_text = str(control_val).strip() if control_val else "Not rated"
+                
+                # Owner (column O)
+                owner_val = get_cell_value(ws, row_idx, col_owner) if col_owner else None
+                owner = str(owner_val).strip() if owner_val and str(owner_val).lower() != "nan" else "Not assigned"
+                
+                # Scores
+                inherent = default_residual
+                if impact_score is not None and likelihood_score is not None:
+                    inherent = min(25, max(1, impact_score * likelihood_score))
+                elif impact_score is not None:
+                    inherent = min(25, impact_score * 5)
+                elif likelihood_score is not None:
+                    inherent = min(25, likelihood_score * 5)
+                
+                residual = inherent
+                if control_eff_numeric is not None:
+                    factor = control_eff_numeric / 5.0
+                    residual = round(inherent * factor)
+                
+                division = "Human Resources"
+                category = infer_category_from_text(desc_str)
+                
+                risks.append({
+                    "division": division,
+                    "division_confidence": 0.95,
+                    "division_source": "consolidated_register_parser",
+                    "risk_name": risk_name,
+                    "risk_statement": desc_str[:500],
+                    "category": category,
+                    "residual_score": min(25, max(1, residual)),
+                    "inherent_score": min(25, max(1, inherent)),
+                    "owner": owner,
+                    "status": "Active",
+                    "due_date": None,
+                    "control_effectiveness": control_eff_text,
+                    "impact_score": impact_score,
+                    "likelihood_score": likelihood_score,
+                })
+                debug_info["risks_found"] += 1
         
-        if rows:
-            return pd.DataFrame(rows), {"extracted": len(rows), "method": "gemini"}
-        return pd.DataFrame(), {"error": "No risks found"}
-        
+        if risks:
+            df = pd.DataFrame(risks)
+            # Remove duplicates by risk statement (keep first)
+            df = df.drop_duplicates(subset=["risk_statement"], keep="first")
+            return df, debug_info
+        else:
+            debug_info["errors"].append("No risks found in any sheet")
+            return pd.DataFrame(), debug_info
+            
     except Exception as e:
-        return pd.DataFrame(), {"error": f"Gemini failed: {str(e)}"}
+        debug_info["errors"].append(str(e))
+        return pd.DataFrame(), debug_info
 
 # =============================================================================
 # MAIN PARSER DISPATCHER
 # =============================================================================
 def parse_uploaded_file_bytes(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    # Priority 1: Direct HR parser
+    # Use the enhanced multi-sheet parser
     df, debug = parse_hr_risk_register_direct(file_bytes, file_name, default_residual)
     if not df.empty:
-        st.success(f"✅ Direct HR parser extracted {len(df)} risks")
+        st.success(f"✅ Extracted {len(df)} risks from all sheets")
         return df, debug
     
-    # Priority 2: Simple fallback parser
-    df, debug = simple_fallback_parser(file_bytes, file_name, default_residual)
-    if not df.empty:
-        st.warning(f"⚠️ Simple fallback parser extracted {len(df)} potential risks")
-        return df, debug
-    
-    # Priority 3: Gemini extraction
+    # Fallback to Gemini if nothing found
     if GEMINI_AVAILABLE and st.session_state.force_gemini:
         df, debug = gemini_extract_risks(file_bytes, file_name, default_residual)
         if not df.empty:
@@ -494,10 +617,6 @@ def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[p
         df_all = df_all.head(10)
     st.session_state.parser_audit = {"total_files": len(uploaded_files), "total_risks": len(df_all)}
     return df_all, all_debug
-
-@st.cache_data
-def cached_parse_file(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    return parse_uploaded_file_bytes(file_bytes, file_name, default_residual)
 
 # =============================================================================
 # SEMANTIC DUPLICATE DETECTION
@@ -584,6 +703,68 @@ Be concise, actionable."""
         return response.text.strip() if response.text else ""
     except:
         return ""
+
+def gemini_extract_risks(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
+    if not GEMINI_AVAILABLE:
+        return pd.DataFrame(), {"error": "Gemini not available"}
+    try:
+        xls = pd.ExcelFile(io.BytesIO(file_bytes))
+        all_content = []
+        for sheet in xls.sheet_names:
+            if sheet.lower() in ["boundaries", "impact", "likelihood", "effectiveness", "risk matrix"]:
+                continue
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None)
+            sheet_str = f"\n[SHEET: {sheet}]\n"
+            for i in range(min(50, df.shape[0])):
+                row_vals = []
+                for j in range(min(20, df.shape[1])):
+                    val = df.iat[i, j]
+                    if pd.notna(val) and str(val).strip():
+                        row_vals.append(str(val).strip())
+                if row_vals:
+                    sheet_str += f"Row {i+1}: {' | '.join(row_vals)}\n"
+            all_content.append(sheet_str)
+        content = "\n".join(all_content)[:8000]
+        prompt = f"""
+You are a risk extraction engine. Extract ALL risks as a JSON list.
+Each risk must have: risk_statement, risk_name, owner, residual_score (1-25).
+Return ONLY valid JSON.
+Content:
+{content}
+"""
+        response = ai_model.generate_content(prompt)
+        text = response.text.strip()
+        if text.startswith("```json"): text = text[7:]
+        if text.startswith("```"): text = text[3:]
+        if text.endswith("```"): text = text[:-3]
+        data = json.loads(text)
+        risks = data.get("risks", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        rows = []
+        for r in risks:
+            stmt = r.get("risk_statement", "")
+            if not stmt or len(stmt) < 15:
+                continue
+            rows.append({
+                "division": clean_division_name(file_name),
+                "division_confidence": 0.8,
+                "division_source": "gemini",
+                "risk_name": r.get("risk_name", stmt[:50]),
+                "risk_statement": stmt[:500],
+                "category": "Uncategorised",
+                "residual_score": min(25, max(1, int(r.get("residual_score", default_residual)))),
+                "inherent_score": min(25, int(r.get("residual_score", default_residual)) + 3),
+                "owner": r.get("owner", "Not assigned"),
+                "status": "Active",
+                "due_date": None,
+                "control_effectiveness": "Not rated",
+                "impact_score": r.get("impact_score"),
+                "likelihood_score": r.get("likelihood_score"),
+            })
+        if rows:
+            return pd.DataFrame(rows), {"extracted": len(rows), "method": "gemini"}
+        return pd.DataFrame(), {"error": "No risks found"}
+    except Exception as e:
+        return pd.DataFrame(), {"error": f"Gemini failed: {str(e)}"}
 
 # =============================================================================
 # INTELLIGENCE ENGINE
