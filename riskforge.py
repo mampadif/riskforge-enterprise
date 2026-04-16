@@ -135,8 +135,61 @@ def cached_ai_summary(snapshot_json: str, company: str) -> str:
     return ai_polish_narrative(snapshot, company)
 
 # =============================================================================
-# HELPER FUNCTIONS
+# UNIVERSAL PARSER HELPERS
 # =============================================================================
+def normalize_text(val: Any) -> str:
+    if val is None:
+        return ""
+    try:
+        if pd.isna(val):
+            return ""
+    except Exception:
+        pass
+    text = str(val).replace("\xa0", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+def safe_is_blank(val: Any) -> bool:
+    return normalize_text(val) == ""
+
+def merged_cell_value(ws, row_idx: int, col_idx: int) -> Any:
+    cell = ws.cell(row=row_idx, column=col_idx)
+    if cell.value is not None:
+        return cell.value
+
+    for merged_range in ws.merged_cells.ranges:
+        if (merged_range.min_row <= row_idx <= merged_range.max_row
+                and merged_range.min_col <= col_idx <= merged_range.max_col):
+            return ws.cell(merged_range.min_row, merged_range.min_col).value
+    return None
+
+def parse_due_date(val: Any) -> Optional[date]:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+
+    text = normalize_text(val)
+    if not text:
+        return None
+
+    for fmt in [
+        "%B %d, %Y", "%b %d, %Y", "%b-%y", "%B-%y",
+        "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%d/%m/%Y",
+        "%d-%b-%y", "%b-%Y",
+    ]:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except Exception:
+            pass
+
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.notna(parsed):
+        return parsed.date()
+    return None
+
 def clean_division_name(filename: str) -> str:
     name = re.sub(r"\.xlsx$|\.xls$|\.csv$", "", filename, flags=re.IGNORECASE)
     name = re.sub(r"^copy of\s+", "", name, flags=re.IGNORECASE)
@@ -144,384 +197,497 @@ def clean_division_name(filename: str) -> str:
     name = re.sub(r"\s+", " ", name)
     return name.title() if name else "Unknown Division"
 
+def extract_division_from_sheet_context(file_name: str, sheet_name: str, header_preview: List[str]) -> str:
+    combined = " ".join([file_name, sheet_name] + header_preview).lower()
+    mappings = {
+        "human resources": ["human resources", "hr risk register", "hr "],
+        "information technology": ["information technology", "it risk register", "ict"],
+        "finance": ["finance", "financial"],
+        "legal": ["legal"],
+        "strategy": ["strategy", "strategic planning"],
+        "research": ["research"],
+        "office support": ["office support"],
+        "facilities": ["facilities"],
+        "risk management": ["risk monitoring", "risk register"],
+    }
+    for division, keywords in mappings.items():
+        if any(keyword in combined for keyword in keywords):
+            return division.title()
+    return clean_division_name(file_name)
+
 def parse_risk_score(val: Any) -> Optional[float]:
-    """Convert various text/number representations to a 1-5 numeric score."""
-    if pd.isna(val):
+    if val is None:
         return None
-    s = str(val).strip().lower()
-    if s in ["#n/a", "#value!", "#ref!", "#name?", "#num!", "#null!", "none", "nan", "", "0"]:
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+
+    s = normalize_text(val).lower()
+    if s in {"#n/a", "#value!", "#ref!", "#name?", "#num!", "#null!", "none", "nan", ""}:
         return None
-    
+
     impact_map = {
-        "critical": 5, "major": 4, "moderate": 3, "significant": 2, "minor": 1
+        "critical": 5, "major": 4, "moderate": 3, "significant": 2, "minor": 1,
     }
     likelihood_map = {
-        "almost certain": 5, "likely": 4, "moderate": 3, "unlikely": 2, "rare": 1
+        "almost certain": 5, "likely": 4, "moderate": 3, "unlikely": 2, "rare": 1,
     }
+    inherent_map = {
+        "low": 5, "medium": 10, "high": 16, "critical": 20,
+    }
+
     if s in impact_map:
         return float(impact_map[s])
     if s in likelihood_map:
         return float(likelihood_map[s])
-    
-    match = re.search(r'(\d+(?:\.\d+)?)', s)
+    if s in inherent_map:
+        return float(inherent_map[s])
+
+    match = re.search(r"(\d+(?:\.\d+)?)", s)
     if match:
         num = float(match.group(1))
-        if 1 <= num <= 5:
+        if 1 <= num <= 25:
             return num
-        elif 1 <= num <= 25:
-            return round(num / 5)
     return None
 
 def parse_control_effectiveness(val: Any) -> Optional[int]:
-    """Convert control effectiveness text to numeric 1-5 scale (1=Very Good, 5=Unsatisfactory)."""
-    if pd.isna(val):
+    if val is None:
         return None
-    s = str(val).strip().lower()
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+
+    s = normalize_text(val).lower()
     mapping = {
-        "very good": 1, "good": 2, "satisfactory": 3, "weak": 4, "unsatisfactory": 5
+        "very good": 1, "good": 2, "satisfactory": 3,
+        "moderate": 3, "weak": 4, "unsatisfactory": 5, "ineffective": 5,
     }
     for key, num in mapping.items():
         if key in s:
             return num
-    match = re.search(r'(\d+)', s)
+
+    match = re.search(r"(\d+)", s)
     if match:
         num = int(match.group(1))
         if 1 <= num <= 5:
             return num
     return None
 
-def parse_due_date(val: Any) -> Optional[date]:
-    if val is None:
-        return None
-    if isinstance(val, (datetime, pd.Timestamp)):
-        return val.date()
-    if isinstance(val, date):
-        return val
-    s = str(val).strip()
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except:
-            continue
-    return None
+def infer_category_from_text(title: str, statement: str, cause: str, raw_category: str = "") -> str:
+    combined = " ".join([
+        normalize_text(raw_category),
+        normalize_text(title),
+        normalize_text(statement),
+        normalize_text(cause),
+    ]).lower()
 
-def normalize_text(val: Any) -> str:
-    if val is None:
-        return ""
-    s = str(val).strip()
-    if s.lower() in ["nan", "none", "null", "#n/a"]:
-        return ""
-    return s
+    if raw_category:
+        raw = normalize_text(raw_category)
+        if raw:
+            return raw
 
-def merged_cell_value(ws, row: int, col: int) -> Any:
-    """Return the value of a cell, accounting for merged ranges."""
-    cell = ws.cell(row=row, column=col)
-    if cell.coordinate in ws.merged_cells:
-        for merged_range in ws.merged_cells.ranges:
-            if cell.coordinate in merged_range:
-                min_col, min_row, max_col, max_row = merged_range.bounds
-                return ws.cell(row=min_row, column=min_col).value
-    val = cell.value
-    if isinstance(val, str) and val.startswith("#"):
-        return None
-    return val
+    if any(term in combined for term in ["compliance", "regulation", "labour law", "employment act", "legal"]):
+        return "Compliance/Legal"
+    if any(term in combined for term in ["staff", "talent", "retention", "morale", "employee", "recruit", "succession", "turnover", "hr"]):
+        return "People/HR"
+    if any(term in combined for term in ["budget", "funding", "financial", "revenue", "cash"]):
+        return "Financial"
+    if any(term in combined for term in ["system", "cyber", "data", "technology", "it", "ict", "information technology"]):
+        return "ICT/Cyber"
+    if any(term in combined for term in ["safety", "injury", "accident", "health"]):
+        return "Health/Safety"
+    if any(term in combined for term in ["strategy", "strategic"]):
+        return "Strategic"
+    if any(term in combined for term in ["reputation", "brand", "image"]):
+        return "Reputational"
+    if any(term in combined for term in ["environment", "climate", "pollution"]):
+        return "Environmental"
+    return "Operational"
 
-def find_sheet_by_keywords(wb, keywords: List[str]) -> Optional[str]:
-    """Return the first sheet name that contains all given keywords (case-insensitive)."""
-    for sheet in wb.sheetnames:
-        sheet_lower = sheet.lower()
-        if all(kw.lower() in sheet_lower for kw in keywords):
-            return sheet
-    return None
+# =============================================================================
+# SHEET / HEADER DISCOVERY
+# =============================================================================
+FIELD_PATTERNS: Dict[str, List[str]] = {
+    "risk_no": [r"risk\s*no", r"risk\s*id", r"identifier"],
+    "objective": [r"link\s*to\s*objective", r"objective"],
+    "risk_name": [r"risk\s*description", r"risk\s*title", r"risk\s*name"],
+    "risk_statement": [r"risk\s*definition", r"statement", r"risk\s*event"],
+    "cause": [r"cause", r"root\s*cause"],
+    "category": [r"risk\s*category", r"category", r"type\s*of\s*risk"],
+    "impact_text": [r"impact"],
+    "likelihood_text": [r"likelihood"],
+    "inherent_text": [r"inherent\s*risk", r"inherent"],
+    "residual_text": [r"residual\s*risk", r"residual"],
+    "controls": [r"controls", r"control\s*measure", r"existing\s*controls"],
+    "control_effectiveness_text": [r"control\s*effectiveness", r"effectiveness"],
+    "owner": [r"risk\s*owner", r"owner", r"accountable"],
+    "strategy": [r"risk\s*strategy", r"strategy", r"response"],
+    "treatment": [r"risk\s*treatment", r"action\s*plan", r"mitigation", r"treatment"],
+    "status": [r"status", r"progress"],
+    "due_date": [r"treatment\s*due\s*date", r"due\s*date", r"target\s*date", r"completion\s*date"],
+}
 
-def detect_header_row_and_columns(ws) -> Tuple[Optional[int], Dict[str, int]]:
-    """
-    Scan the first 20 rows to find a header row containing risk-related keywords.
-    Returns (header_row_index, column_mapping).
-    """
-    column_keywords = {
-        "risk_no": ["risk no", "risk number", "risk id", "ref"],
-        "risk_name": ["risk description", "risk name", "risk title"],
-        "risk_statement": ["risk definition", "risk statement", "event, causes, impacts"],
-        "cause": ["cause", "root cause"],
-        "category": ["category", "risk category"],
-        "impact_text": ["impact", "impact (1-5)"],
-        "likelihood_text": ["likelihood", "likelihood score", "likelihood (1-5)"],
-        "inherent_text": ["inherent risk", "inherent"],
-        "controls": ["controls", "what is in place"],
-        "control_effectiveness_text": ["control effectiveness", "effectiveness"],
-        "owner": ["risk owner", "owner"],
-        "strategy": ["risk strategy", "strategy"],
-        "treatment": ["treatment", "action plan"],
-        "due_date": ["due date", "treatment due date"],
-    }
-    best_score = 0
+def is_helper_sheet(sheet_name: str) -> bool:
+    s = sheet_name.lower()
+    helper_keywords = [
+        "boundary", "impact", "likelihood", "effectiveness", "matrix", "lookup",
+        "legend", "instruction", "guide", "summary", "dashboard", "heatmap", "chart", "pivot",
+    ]
+    return any(word in s for word in helper_keywords)
+
+def detect_header_row_and_columns(ws, scan_rows: int = 30, max_cols: int = 50) -> Tuple[Optional[int], Dict[str, int], int]:
     best_row = None
-    best_map = {}
+    best_map: Dict[str, int] = {}
+    best_score = 0
 
-    for row_idx in range(1, min(20, ws.max_row + 1)):
-        current_map = {}
+    for row_idx in range(1, min(scan_rows, ws.max_row) + 1):
+        current_map: Dict[str, int] = {}
         score = 0
-        for col_idx in range(1, min(30, ws.max_column + 1)):
-            cell_val = merged_cell_value(ws, row_idx, col_idx)
-            if not cell_val:
+
+        for col_idx in range(1, min(max_cols, ws.max_column) + 1):
+            val = normalize_text(merged_cell_value(ws, row_idx, col_idx)).lower()
+            if not val:
                 continue
-            cell_str = str(cell_val).lower()
-            for field, keywords in column_keywords.items():
+
+            for field, patterns in FIELD_PATTERNS.items():
                 if field in current_map:
                     continue
-                if any(kw in cell_str for kw in keywords):
+                if any(re.search(pattern, val) for pattern in patterns):
                     current_map[field] = col_idx
                     score += 1
                     break
-        if score > best_score:
-            best_score = score
+
+        if score > best_score and ("risk_name" in current_map or "risk_statement" in current_map):
             best_row = row_idx
             best_map = current_map
+            best_score = score
 
-    if best_score >= 3:  # Require at least 3 columns identified
-        return best_row, best_map
-    return None, {}
+    return best_row, best_map, best_score
 
-def infer_category_from_text(*texts: str) -> str:
-    combined = " ".join(texts).lower()
-    if any(k in combined for k in ["compliance", "regulation", "labour law", "employment act"]):
-        return "Compliance/Legal"
-    elif any(k in combined for k in ["financial", "budget", "funding", "revenue"]):
-        return "Financial"
-    elif any(k in combined for k in ["cyber", "data", "it", "information security", "hack"]):
-        return "ICT/Cyber"
-    elif any(k in combined for k in ["staff", "employee", "turnover", "morale", "talent", "training"]):
-        return "People/HR"
-    elif any(k in combined for k in ["safety", "health", "injury", "accident", "she"]):
-        return "Health/Safety"
-    elif any(k in combined for k in ["reputation", "brand"]):
-        return "Reputational"
-    elif any(k in combined for k in ["operational", "process", "disruption"]):
-        return "Operational"
-    elif any(k in combined for k in ["strategic", "mandate"]):
-        return "Strategic"
-    return "Uncategorised"
+def rank_candidate_sheets(wb) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        header_row, col_map, score = detect_header_row_and_columns(ws)
+
+        name_bonus = 0
+        lower_name = sheet_name.lower()
+        if "risk" in lower_name:
+            name_bonus += 3
+        if "register" in lower_name:
+            name_bonus += 3
+        if "monitor" in lower_name:
+            name_bonus += 1
+        if "quarter" in lower_name:
+            name_bonus += 1
+        if is_helper_sheet(sheet_name):
+            name_bonus -= 4
+
+        total_score = score + name_bonus
+
+        candidates.append({
+            "sheet_name": sheet_name,
+            "header_row": header_row,
+            "column_map": col_map,
+            "header_score": score,
+            "total_score": total_score,
+        })
+
+    candidates.sort(key=lambda x: x["total_score"], reverse=True)
+    return candidates
 
 # =============================================================================
-# ENHANCED DIRECT STRUCTURED PARSER (WITH COLUMN DETECTION)
+# ROW PARSING
 # =============================================================================
-def parse_hr_risk_register_direct(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def should_skip_row(
+    row_idx: int,
+    risk_no: str,
+    risk_name: str,
+    risk_statement: str,
+    cause: str,
+    controls: str
+) -> Tuple[bool, str]:
+    combined_gate_text = " ".join([risk_no, risk_name, risk_statement, cause, controls]).strip()
+    if not combined_gate_text:
+        return True, "blank_row"
+
+    lower_gate = combined_gate_text.lower()
+
+    metadata_indicators = [
+        "risk description", "risk definition", "link to objective", "control effectiveness",
+        "treatment due date", "risk strategy", "risk owner", "impact (1-5)", "likelihood score",
+        "inherent risk", "residual risk", "division/dept", "what is in place to prevent",
+    ]
+    if any(ind in lower_gate for ind in metadata_indicators):
+        return True, "metadata_row"
+
+    if risk_name.startswith("=") or risk_statement.startswith("="):
+        return True, "formula_row"
+
+    if not risk_name and not risk_statement:
+        return True, "missing_title_and_statement"
+
+    return False, "accepted"
+
+def compute_scores(
+    raw_impact: Any,
+    raw_likelihood: Any,
+    raw_inherent: Any,
+    raw_residual: Any,
+    raw_control_effectiveness: Any,
+    default_residual: int
+) -> Tuple[int, int, Optional[float], Optional[float], Optional[int], str]:
+    impact_score = parse_risk_score(raw_impact)
+    likelihood_score = parse_risk_score(raw_likelihood)
+    inherent_score = parse_risk_score(raw_inherent)
+    residual_score = parse_risk_score(raw_residual)
+
+    control_eff_numeric = parse_control_effectiveness(raw_control_effectiveness)
+    control_eff_text = normalize_text(raw_control_effectiveness) or "Not rated"
+
+    # Inherent
+    if inherent_score is not None and inherent_score > 5:
+        inherent = float(inherent_score)
+    elif impact_score is not None and likelihood_score is not None:
+        inherent = float(impact_score * likelihood_score)
+    elif impact_score is not None:
+        inherent = float(impact_score * 5)
+    elif likelihood_score is not None:
+        inherent = float(likelihood_score * 5)
+    else:
+        inherent = float(default_residual)
+
+    inherent = min(25, max(1, round(inherent)))
+
+    # Residual
+    if residual_score is not None and residual_score > 5:
+        residual = float(residual_score)
+    elif control_eff_numeric is not None:
+        residual = round(inherent * (control_eff_numeric / 5.0))
+    else:
+        residual = inherent
+
+    residual = min(25, max(1, round(residual)))
+
+    return residual, inherent, impact_score, likelihood_score, control_eff_numeric, control_eff_text
+
+def parse_structured_sheet(
+    ws,
+    sheet_name: str,
+    col_map: Dict[str, int],
+    header_row: int,
+    file_name: str,
+    default_residual: int
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     risks: List[Dict[str, Any]] = []
-    debug_rows: List[Dict[str, Any]] = []
+    row_audit: List[Dict[str, Any]] = []
+
+    header_preview = [normalize_text(merged_cell_value(ws, header_row, c)) for c in range(1, min(ws.max_column, 20) + 1)]
+    division_name = extract_division_from_sheet_context(file_name, sheet_name, header_preview)
+
+    def get_field(row_idx: int, field_name: str) -> Any:
+        col_idx = col_map.get(field_name)
+        if not col_idx:
+            return None
+        return merged_cell_value(ws, row_idx, col_idx)
+
+    blank_streak = 0
+    start_row = header_row + 1
+
+    for row_idx in range(start_row, min(ws.max_row + 1, start_row + 300)):
+        raw_risk_no = get_field(row_idx, "risk_no")
+        raw_objective = get_field(row_idx, "objective")
+        raw_risk_name = get_field(row_idx, "risk_name")
+        raw_risk_statement = get_field(row_idx, "risk_statement")
+        raw_cause = get_field(row_idx, "cause")
+        raw_category = get_field(row_idx, "category")
+        raw_impact_text = get_field(row_idx, "impact_text")
+        raw_likelihood_text = get_field(row_idx, "likelihood_text")
+        raw_inherent_text = get_field(row_idx, "inherent_text")
+        raw_residual_text = get_field(row_idx, "residual_text")
+        raw_controls = get_field(row_idx, "controls")
+        raw_control_eff = get_field(row_idx, "control_effectiveness_text")
+        raw_owner = get_field(row_idx, "owner")
+        raw_strategy = get_field(row_idx, "strategy")
+        raw_treatment = get_field(row_idx, "treatment")
+        raw_status = get_field(row_idx, "status")
+        raw_due_date = get_field(row_idx, "due_date")
+
+        risk_no = normalize_text(raw_risk_no)
+        objective = normalize_text(raw_objective)
+        risk_name = normalize_text(raw_risk_name)
+        risk_statement = normalize_text(raw_risk_statement)
+        cause = normalize_text(raw_cause)
+        category_raw = normalize_text(raw_category)
+        controls = normalize_text(raw_controls)
+        owner = normalize_text(raw_owner)
+        strategy = normalize_text(raw_strategy)
+        treatment = normalize_text(raw_treatment)
+        status = normalize_text(raw_status) or "Active"
+        due_date_raw = normalize_text(raw_due_date)
+
+        # Fallbacks
+        if not risk_statement and risk_name:
+            risk_statement = risk_name
+        if not risk_name and risk_statement:
+            risk_name = risk_statement[:80]
+
+        skip, reason = should_skip_row(
+            row_idx=row_idx,
+            risk_no=risk_no,
+            risk_name=risk_name,
+            risk_statement=risk_statement,
+            cause=cause,
+            controls=controls,
+        )
+
+        if reason == "blank_row":
+            blank_streak += 1
+            row_audit.append({
+                "row": row_idx,
+                "risk_no": risk_no,
+                "risk_name": risk_name,
+                "risk_statement": risk_statement,
+                "status": "skipped",
+                "reason": reason,
+            })
+            if blank_streak >= 12:
+                break
+            continue
+
+        blank_streak = 0
+
+        if skip:
+            row_audit.append({
+                "row": row_idx,
+                "risk_no": risk_no,
+                "risk_name": risk_name,
+                "risk_statement": risk_statement,
+                "status": "skipped",
+                "reason": reason,
+            })
+            continue
+
+        residual, inherent, impact_score, likelihood_score, control_eff_numeric, control_eff_text = compute_scores(
+            raw_impact=raw_impact_text,
+            raw_likelihood=raw_likelihood_text,
+            raw_inherent=raw_inherent_text,
+            raw_residual=raw_residual_text,
+            raw_control_effectiveness=raw_control_eff,
+            default_residual=default_residual,
+        )
+
+        parsed_due_date = parse_due_date(raw_due_date)
+        category = infer_category_from_text(
+            title=risk_name,
+            statement=risk_statement,
+            cause=cause,
+            raw_category=category_raw,
+        )
+
+        risks.append({
+            "division": division_name,
+            "division_confidence": 0.95,
+            "division_source": f"structured_sheet:{sheet_name}",
+            "source_sheet": sheet_name,
+            "risk_no": risk_no,
+            "objective_link": objective,
+            "risk_name": risk_name,
+            "risk_statement": risk_statement,
+            "cause": cause,
+            "category": category,
+            "residual_score": residual,
+            "inherent_score": inherent,
+            "owner": owner or "Not assigned",
+            "status": status,
+            "due_date": parsed_due_date,
+            "due_date_raw": due_date_raw,
+            "control_effectiveness": control_eff_text,
+            "control_effectiveness_numeric": control_eff_numeric,
+            "impact_score": impact_score,
+            "likelihood_score": likelihood_score,
+            "controls": controls,
+            "strategy": strategy or "Treat",
+            "treatment_plan": treatment,
+        })
+
+        row_audit.append({
+            "row": row_idx,
+            "risk_no": risk_no,
+            "risk_name": risk_name,
+            "risk_statement": risk_statement,
+            "status": "accepted",
+            "reason": "parsed_successfully",
+        })
+
+    debug = {
+        "sheet_used": sheet_name,
+        "header_row": header_row,
+        "column_map": col_map,
+        "rows_checked": len(row_audit),
+        "risks_found": len(risks),
+        "row_audit_preview": row_audit[:100],
+        "skipped_rows": [r for r in row_audit if r["status"] == "skipped"][:60],
+    }
+
+    return pd.DataFrame(risks), debug
+
+# =============================================================================
+# UNIVERSAL PARSER ENTRY POINT
+# =============================================================================
+def parse_structured_risk_register(
+    file_bytes: bytes,
+    file_name: str,
+    default_residual: int
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     debug_info: Dict[str, Any] = {
-        "parser": "direct_structured_register",
-        "sheet_used": None,
-        "header_row": None,
-        "column_map": {},
-        "rows_checked": 0,
-        "risks_found": 0,
-        "skipped_rows": [],
+        "parser": "universal_structured_register_v1",
+        "candidate_sheets": [],
+        "selected_sheet": None,
         "error": None,
     }
 
     try:
         wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
 
-        target_sheet = find_sheet_by_keywords(wb, ["consolidated", "risk", "register"])
-        if not target_sheet:
-            target_sheet = wb.sheetnames[0] if wb.sheetnames else None
-        if not target_sheet:
-            debug_info["error"] = "No worksheet found"
+        candidates = rank_candidate_sheets(wb)
+        debug_info["candidate_sheets"] = candidates[:10]
+
+        strong_candidates = [
+            c for c in candidates
+            if c["header_row"] is not None
+            and c["header_score"] >= 4
+            and ("risk_name" in c["column_map"] or "risk_statement" in c["column_map"])
+        ]
+
+        if not strong_candidates:
+            debug_info["error"] = "No structured risk register sheet detected"
             return pd.DataFrame(), debug_info
 
-        debug_info["sheet_used"] = target_sheet
-        ws = wb[target_sheet]
+        best = strong_candidates[0]
+        debug_info["selected_sheet"] = best["sheet_name"]
 
-        header_row, col_map = detect_header_row_and_columns(ws)
-        debug_info["header_row"] = header_row
-        debug_info["column_map"] = col_map
+        ws = wb[best["sheet_name"]]
+        df, parse_debug = parse_structured_sheet(
+            ws=ws,
+            sheet_name=best["sheet_name"],
+            col_map=best["column_map"],
+            header_row=best["header_row"],
+            file_name=file_name,
+            default_residual=default_residual,
+        )
 
-        required_any = {"risk_name", "risk_statement"}
-        if header_row is None or not required_any.intersection(col_map.keys()):
-            debug_info["error"] = "Could not detect structured risk header row"
-            return pd.DataFrame(), debug_info
+        debug_info.update(parse_debug)
 
-        start_row = header_row + 1
-        blank_streak = 0
+        if not df.empty:
+            return df, debug_info
 
-        for row_idx in range(start_row, min(ws.max_row + 1, start_row + 200)):
-            debug_info["rows_checked"] += 1
-
-            def get_field(field_name: str) -> Any:
-                col_idx = col_map.get(field_name)
-                if not col_idx:
-                    return None
-                return merged_cell_value(ws, row_idx, col_idx)
-
-            raw_risk_no = get_field("risk_no")
-            raw_risk_name = get_field("risk_name")
-            raw_risk_statement = get_field("risk_statement")
-            raw_cause = get_field("cause")
-            raw_category = get_field("category")
-            raw_impact_text = get_field("impact_text")
-            raw_likelihood_text = get_field("likelihood_text")
-            raw_inherent_text = get_field("inherent_text")
-            raw_controls = get_field("controls")
-            raw_control_eff = get_field("control_effectiveness_text")
-            raw_owner = get_field("owner")
-            raw_strategy = get_field("strategy")
-            raw_treatment = get_field("treatment")
-            raw_due_date = get_field("due_date")
-
-            risk_name = normalize_text(raw_risk_name)
-            risk_statement = normalize_text(raw_risk_statement)
-            cause = normalize_text(raw_cause)
-            category_raw = normalize_text(raw_category)
-            controls = normalize_text(raw_controls)
-            owner = normalize_text(raw_owner)
-            strategy = normalize_text(raw_strategy)
-            treatment = normalize_text(raw_treatment)
-            risk_no = normalize_text(raw_risk_no)
-
-            # Fallbacks: if one of title/statement is missing, use the other
-            if not risk_statement and risk_name:
-                risk_statement = risk_name
-            if not risk_name and risk_statement:
-                risk_name = risk_statement[:80]
-
-            # Stop after long blank region
-            if not risk_name and not risk_statement and not cause and not controls:
-                blank_streak += 1
-                if blank_streak >= 10:
-                    break
-                debug_rows.append({
-                    "row": row_idx,
-                    "risk_name": risk_name,
-                    "risk_statement": risk_statement,
-                    "status": "skipped",
-                    "reason": "blank_row",
-                })
-                continue
-
-            blank_streak = 0
-
-            combined_gate_text = " ".join([risk_name, risk_statement, cause, controls]).strip().lower()
-
-            metadata_indicators = [
-                "risk description",
-                "risk definition",
-                "link to objective",
-                "control effectiveness",
-                "treatment due date",
-                "risk strategy",
-                "risk owner",
-                "impact (1-5)",
-                "likelihood score",
-                "inherent risk",
-                "what is in place to prevent",
-                "division/dept",
-            ]
-
-            if not combined_gate_text:
-                debug_rows.append({
-                    "row": row_idx,
-                    "risk_name": risk_name,
-                    "risk_statement": risk_statement,
-                    "status": "skipped",
-                    "reason": "empty_combined_text",
-                })
-                continue
-
-            if any(indicator in combined_gate_text for indicator in metadata_indicators):
-                debug_rows.append({
-                    "row": row_idx,
-                    "risk_name": risk_name,
-                    "risk_statement": risk_statement,
-                    "status": "skipped",
-                    "reason": "metadata_row",
-                })
-                continue
-
-            if risk_name.startswith("=") or risk_statement.startswith("="):
-                debug_rows.append({
-                    "row": row_idx,
-                    "risk_name": risk_name,
-                    "risk_statement": risk_statement,
-                    "status": "skipped",
-                    "reason": "formula_row",
-                })
-                continue
-
-            impact_score = parse_risk_score(raw_impact_text)
-            likelihood_score = parse_risk_score(raw_likelihood_text)
-            inherent_score = parse_risk_score(raw_inherent_text)
-
-            if inherent_score is not None and inherent_score <= 5 and impact_score and likelihood_score:
-                inherent = float(impact_score * likelihood_score)
-            elif inherent_score is not None and inherent_score > 5:
-                inherent = float(inherent_score)
-            elif impact_score is not None and likelihood_score is not None:
-                inherent = float(impact_score * likelihood_score)
-            elif impact_score is not None:
-                inherent = float(impact_score * 5)
-            elif likelihood_score is not None:
-                inherent = float(likelihood_score * 5)
-            else:
-                inherent = float(default_residual)
-
-            inherent = min(25, max(1, round(inherent)))
-
-            control_eff_numeric = parse_control_effectiveness(raw_control_eff)
-            control_eff_text = normalize_text(raw_control_eff) or "Not rated"
-
-            if control_eff_numeric is not None:
-                residual = round(inherent * (control_eff_numeric / 5.0))
-                residual = min(25, max(1, residual))
-            else:
-                residual = inherent
-
-            parsed_due_date = parse_due_date(raw_due_date)
-            category = infer_category_from_text(risk_name, risk_statement, cause, category_raw)
-            owner_final = owner or "Not assigned"
-            strategy_final = strategy or "Treat"
-
-            risks.append({
-                "division": "Human Resources" if "hr" in file_name.lower() or "human resource" in file_name.lower() else clean_division_name(file_name),
-                "division_confidence": 0.95,
-                "division_source": "direct_structured_parser",
-                "risk_no": risk_no,
-                "risk_name": risk_name,
-                "risk_statement": risk_statement,
-                "cause": cause,
-                "category": category,
-                "residual_score": residual,
-                "inherent_score": inherent,
-                "owner": owner_final,
-                "status": "Active",
-                "due_date": parsed_due_date,
-                "due_date_raw": normalize_text(raw_due_date),
-                "control_effectiveness": control_eff_text,
-                "control_effectiveness_numeric": control_eff_numeric,
-                "impact_score": impact_score,
-                "likelihood_score": likelihood_score,
-                "controls": controls,
-                "strategy": strategy_final,
-                "treatment_plan": treatment,
-            })
-
-            debug_rows.append({
-                "row": row_idx,
-                "risk_name": risk_name,
-                "risk_statement": risk_statement,
-                "status": "accepted",
-                "reason": "parsed_successfully",
-            })
-
-            debug_info["risks_found"] += 1
-
-        debug_info["skipped_rows"] = [r for r in debug_rows if r["status"] == "skipped"][:40]
-        debug_info["row_audit_preview"] = debug_rows[:60]
-
-        if risks:
-            return pd.DataFrame(risks), debug_info
-
-        debug_info["error"] = "No valid risks found in structured parser"
+        debug_info["error"] = "Structured sheet detected but no risks parsed"
         return pd.DataFrame(), debug_info
 
     except Exception as exc:
@@ -529,126 +695,86 @@ def parse_hr_risk_register_direct(file_bytes: bytes, file_name: str, default_res
         return pd.DataFrame(), debug_info
 
 # =============================================================================
-# MAIN PARSER DISPATCHER
+# SIMPLE FALLBACK PARSER
 # =============================================================================
-def parse_uploaded_file_bytes(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    df, debug = parse_hr_risk_register_direct(file_bytes, file_name, default_residual)
-    if not df.empty:
-        st.success(f"✅ Extracted {len(df)} risks")
-        return df, debug
-    
-    if GEMINI_AVAILABLE and st.session_state.force_gemini:
-        df, debug = gemini_extract_risks(file_bytes, file_name, default_residual)
-        if not df.empty:
-            st.success(f"✅ Gemini extracted {len(df)} risks")
-            return df, debug
-    
-    return pd.DataFrame(), {"error": "No risks could be extracted"}
+def simple_fallback_parser(
+    file_bytes: bytes,
+    file_name: str,
+    default_residual: int
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    risks: List[Dict[str, Any]] = []
+    debug_info: Dict[str, Any] = {"parser": "simple_fallback", "cells_scanned": 0, "risks_found": 0}
 
-def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[pd.DataFrame, List[Dict]]:
-    all_risks = []
-    all_debug = []
-    for file in uploaded_files:
-        df, debug = cached_parse_file(file.getvalue(), file.name, default_residual)
-        all_debug.append(debug)
-        if not df.empty:
-            all_risks.append(df)
-    if not all_risks:
-        return pd.DataFrame(), all_debug
-    df_all = pd.concat(all_risks, ignore_index=True)
-    df_all, _ = detect_semantic_duplicates(df_all, threshold=0.85)
-    df_all["residual_level"] = df_all["residual_score"].apply(lambda x: "Critical" if x >= 20 else "High" if x >= 12 else "Medium" if x >= 6 else "Low")
-    if tier == "free":
-        df_all = df_all.head(10)
-    st.session_state.parser_audit = {"total_files": len(uploaded_files), "total_risks": len(df_all)}
-    return df_all, all_debug
-
-# =============================================================================
-# SEMANTIC DUPLICATE DETECTION
-# =============================================================================
-def normalize_for_dedupe(text: str) -> str:
-    if not isinstance(text, str):
-        return ""
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-def embedding_similarity(texts: List[str]) -> Optional[np.ndarray]:
-    if not EMBEDDING_AVAILABLE or len(texts) < 2:
-        return None
-    model = get_embedding_model()
-    if model is None:
-        return None
     try:
-        embeddings = model.encode(texts)
-        return cosine_similarity(embeddings)
-    except:
-        return None
+        wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
 
-def detect_semantic_duplicates(df: pd.DataFrame, threshold: float = 0.85) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if df.empty:
-        return df, pd.DataFrame()
-    df = df.copy()
-    df["_normalized"] = df["risk_statement"].fillna("").apply(normalize_for_dedupe)
-    df["_hash"] = df["_normalized"].apply(lambda x: hashlib.md5(x.encode()).hexdigest())
-    df = df.drop_duplicates(subset=["_hash"], keep="first")
-    keep_indices = []
-    duplicate_map = []
-    statements = df["_normalized"].tolist()
-    sim_matrix = embedding_similarity(statements) if EMBEDDING_AVAILABLE and len(statements) > 1 else None
-    for i, stmt in enumerate(statements):
-        is_duplicate = False
-        for j in keep_indices:
-            if j >= len(statements):
+        for sheet_name in wb.sheetnames:
+            if is_helper_sheet(sheet_name):
                 continue
-            if sim_matrix is not None and i < sim_matrix.shape[0] and j < sim_matrix.shape[1]:
-                similarity = sim_matrix[i][j]
-            else:
-                similarity = fuzz.ratio(stmt, statements[j]) / 100.0
-            if similarity >= threshold:
-                duplicate_map.append({"kept_index": j, "dropped_index": i, "similarity": similarity})
-                is_duplicate = True
+
+            ws = wb[sheet_name]
+
+            for row_idx in range(1, min(ws.max_row + 1, 200)):
+                for col_idx in range(1, min(ws.max_column + 1, 30)):
+                    val = merged_cell_value(ws, row_idx, col_idx)
+                    debug_info["cells_scanned"] += 1
+
+                    if isinstance(val, str):
+                        text = normalize_text(val)
+                        if len(text) > 40 and not text.startswith("="):
+                            metadata_indicators = [
+                                "risk monitoring", "period of assessment", "department/ unit",
+                                "description of control", "overall effectiveness", "control categorisation",
+                                "action plan", "residual risk", "risk strategy", "inherent risk",
+                                "risk owner", "impact rating", "likelihood rating", "root cause",
+                                "consequences", "start date", "target completion", "processed by",
+                                "approved by", "recommended by", "signature", "link to objective",
+                                "risk no", "division/ dept",
+                            ]
+                            if not any(ind in text.lower() for ind in metadata_indicators):
+                                risks.append({
+                                    "division": clean_division_name(file_name),
+                                    "division_confidence": 0.60,
+                                    "division_source": f"simple_fallback:{sheet_name}",
+                                    "source_sheet": sheet_name,
+                                    "risk_no": "",
+                                    "objective_link": "",
+                                    "risk_name": text[:80],
+                                    "risk_statement": text[:500],
+                                    "cause": "",
+                                    "category": "Uncategorised",
+                                    "residual_score": default_residual,
+                                    "inherent_score": min(25, default_residual + 3),
+                                    "owner": "Not assigned",
+                                    "status": "Active",
+                                    "due_date": None,
+                                    "due_date_raw": "",
+                                    "control_effectiveness": "Not rated",
+                                    "control_effectiveness_numeric": None,
+                                    "impact_score": None,
+                                    "likelihood_score": None,
+                                    "controls": "",
+                                    "strategy": "Treat",
+                                    "treatment_plan": "",
+                                })
+                                debug_info["risks_found"] += 1
+                                if len(risks) >= 20:
+                                    break
+                if len(risks) >= 20:
+                    break
+            if len(risks) >= 20:
                 break
-        if not is_duplicate:
-            keep_indices.append(i)
-    deduped = df.iloc[keep_indices].reset_index(drop=True)
-    duplicates_df = pd.DataFrame(duplicate_map) if duplicate_map else pd.DataFrame()
-    deduped = deduped.drop(columns=["_normalized", "_hash"])
-    return deduped, duplicates_df
+
+    except Exception as exc:
+        debug_info["error"] = str(exc)
+
+    if risks:
+        return pd.DataFrame(risks), debug_info
+    return pd.DataFrame(), debug_info
 
 # =============================================================================
-# AI FUNCTIONS
+# GEMINI FALLBACK (unchanged)
 # =============================================================================
-def ai_infer_category(statement: str, fallback: str = "Uncategorised") -> str:
-    categories = ["Strategic", "Financial", "Operational", "ICT/Cyber", "Compliance/Legal", "People/HR", "Health/Safety", "Reputational", "Environmental"]
-    if not GEMINI_AVAILABLE or len(statement) < 20:
-        return fallback
-    try:
-        prompt = f"Classify this risk into exactly one of these categories: {', '.join(categories)}. Return ONLY the category name.\nRisk: {statement[:400]}"
-        response = ai_model.generate_content(prompt)
-        result = response.text.strip()
-        if result in categories:
-            return result
-    except:
-        pass
-    return fallback
-
-def ai_polish_narrative(snapshot: Dict, company: str) -> str:
-    if not GEMINI_AVAILABLE:
-        return ""
-    try:
-        prompt = f"""Write a professional, board‑ready executive briefing (2‑3 sentences) for {company}:
-- Health score: {snapshot.get('enterprise_health_score', 0)}/100
-- Critical/high risks: {snapshot.get('critical_count', 0) + snapshot.get('high_count', 0)}
-- Top division: {snapshot.get('top_division', 'N/A')}
-- Appetite breached: {snapshot.get('pct_breached', 0)}%
-Be concise, actionable."""
-        response = ai_model.generate_content(prompt)
-        return response.text.strip() if response.text else ""
-    except:
-        return ""
-
 def gemini_extract_risks(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
     if not GEMINI_AVAILABLE:
         return pd.DataFrame(), {"error": "Gemini not available"}
@@ -712,7 +838,141 @@ Content:
         return pd.DataFrame(), {"error": f"Gemini failed: {str(e)}"}
 
 # =============================================================================
-# INTELLIGENCE ENGINE
+# FINAL DISPATCHER
+# =============================================================================
+def parse_uploaded_file_bytes(
+    file_bytes: bytes,
+    file_name: str,
+    default_residual: int
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    # 1. Universal structured parser
+    df, debug = parse_structured_risk_register(file_bytes, file_name, default_residual)
+    if not df.empty:
+        st.success(f"✅ Extracted {len(df)} risks")
+        return df, debug
+
+    # 2. Simple fallback
+    df, fallback_debug = simple_fallback_parser(file_bytes, file_name, default_residual)
+    if not df.empty:
+        st.warning(f"⚠️ Simple fallback extracted {len(df)} potential risks")
+        return df, fallback_debug
+
+    # 3. Gemini fallback
+    if GEMINI_AVAILABLE and st.session_state.force_gemini:
+        df, gemini_debug = gemini_extract_risks(file_bytes, file_name, default_residual)
+        if not df.empty:
+            st.success(f"✅ Gemini extracted {len(df)} risks")
+            return df, gemini_debug
+        return pd.DataFrame(), gemini_debug
+
+    return pd.DataFrame(), debug
+
+def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[pd.DataFrame, List[Dict]]:
+    all_risks = []
+    all_debug = []
+    for file in uploaded_files:
+        df, debug = cached_parse_file(file.getvalue(), file.name, default_residual)
+        all_debug.append(debug)
+        if not df.empty:
+            all_risks.append(df)
+    if not all_risks:
+        return pd.DataFrame(), all_debug
+    df_all = pd.concat(all_risks, ignore_index=True)
+    df_all, _ = detect_semantic_duplicates(df_all, threshold=0.85)
+    df_all["residual_level"] = df_all["residual_score"].apply(lambda x: "Critical" if x >= 20 else "High" if x >= 12 else "Medium" if x >= 6 else "Low")
+    if tier == "free":
+        df_all = df_all.head(10)
+    st.session_state.parser_audit = {"total_files": len(uploaded_files), "total_risks": len(df_all)}
+    return df_all, all_debug
+
+# =============================================================================
+# SEMANTIC DUPLICATE DETECTION (unchanged)
+# =============================================================================
+def normalize_for_dedupe(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def embedding_similarity(texts: List[str]) -> Optional[np.ndarray]:
+    if not EMBEDDING_AVAILABLE or len(texts) < 2:
+        return None
+    model = get_embedding_model()
+    if model is None:
+        return None
+    try:
+        embeddings = model.encode(texts)
+        return cosine_similarity(embeddings)
+    except:
+        return None
+
+def detect_semantic_duplicates(df: pd.DataFrame, threshold: float = 0.85) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if df.empty:
+        return df, pd.DataFrame()
+    df = df.copy()
+    df["_normalized"] = df["risk_statement"].fillna("").apply(normalize_for_dedupe)
+    df["_hash"] = df["_normalized"].apply(lambda x: hashlib.md5(x.encode()).hexdigest())
+    df = df.drop_duplicates(subset=["_hash"], keep="first")
+    keep_indices = []
+    duplicate_map = []
+    statements = df["_normalized"].tolist()
+    sim_matrix = embedding_similarity(statements) if EMBEDDING_AVAILABLE and len(statements) > 1 else None
+    for i, stmt in enumerate(statements):
+        is_duplicate = False
+        for j in keep_indices:
+            if j >= len(statements):
+                continue
+            if sim_matrix is not None and i < sim_matrix.shape[0] and j < sim_matrix.shape[1]:
+                similarity = sim_matrix[i][j]
+            else:
+                similarity = fuzz.ratio(stmt, statements[j]) / 100.0
+            if similarity >= threshold:
+                duplicate_map.append({"kept_index": j, "dropped_index": i, "similarity": similarity})
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            keep_indices.append(i)
+    deduped = df.iloc[keep_indices].reset_index(drop=True)
+    duplicates_df = pd.DataFrame(duplicate_map) if duplicate_map else pd.DataFrame()
+    deduped = deduped.drop(columns=["_normalized", "_hash"])
+    return deduped, duplicates_df
+
+# =============================================================================
+# AI FUNCTIONS (unchanged)
+# =============================================================================
+def ai_infer_category(statement: str, fallback: str = "Uncategorised") -> str:
+    categories = ["Strategic", "Financial", "Operational", "ICT/Cyber", "Compliance/Legal", "People/HR", "Health/Safety", "Reputational", "Environmental"]
+    if not GEMINI_AVAILABLE or len(statement) < 20:
+        return fallback
+    try:
+        prompt = f"Classify this risk into exactly one of these categories: {', '.join(categories)}. Return ONLY the category name.\nRisk: {statement[:400]}"
+        response = ai_model.generate_content(prompt)
+        result = response.text.strip()
+        if result in categories:
+            return result
+    except:
+        pass
+    return fallback
+
+def ai_polish_narrative(snapshot: Dict, company: str) -> str:
+    if not GEMINI_AVAILABLE:
+        return ""
+    try:
+        prompt = f"""Write a professional, board‑ready executive briefing (2‑3 sentences) for {company}:
+- Health score: {snapshot.get('enterprise_health_score', 0)}/100
+- Critical/high risks: {snapshot.get('critical_count', 0) + snapshot.get('high_count', 0)}
+- Top division: {snapshot.get('top_division', 'N/A')}
+- Appetite breached: {snapshot.get('pct_breached', 0)}%
+Be concise, actionable."""
+        response = ai_model.generate_content(prompt)
+        return response.text.strip() if response.text else ""
+    except:
+        return ""
+
+# =============================================================================
+# INTELLIGENCE ENGINE (unchanged)
 # =============================================================================
 def calculate_weighted_treatment_confidence(row: pd.Series) -> float:
     score = 0.0
@@ -894,7 +1154,7 @@ def generate_board_narrative(snapshot: Dict, comparison: Dict, threshold: int, c
     return "\n".join(narrative)
 
 # =============================================================================
-# EXCEL & PDF EXPORTS
+# EXCEL & PDF EXPORTS (unchanged)
 # =============================================================================
 def style_excel_with_risk_colors(wb):
     level_colors = {
@@ -1012,7 +1272,7 @@ def generate_pdf_board_pack(narrative: str, snapshot: Dict, company: str, report
     return buffer.getvalue()
 
 # =============================================================================
-# DASHBOARD CHARTS
+# DASHBOARD CHARTS (unchanged)
 # =============================================================================
 def create_category_chart(df: pd.DataFrame) -> go.Figure:
     if df.empty:
@@ -1054,7 +1314,7 @@ def create_treatment_gauge(confidence: float) -> go.Figure:
     return fig
 
 # =============================================================================
-# UI COMPONENTS
+# UI COMPONENTS (unchanged)
 # =============================================================================
 def apply_custom_theme(primary: str, secondary: str) -> None:
     st.markdown(f"""
@@ -1178,7 +1438,7 @@ def render_sidebar():
             st.checkbox("🤖 Force Gemini Extraction", key="force_gemini", value=True)
 
 # =============================================================================
-# MAIN APP
+# MAIN APP (unchanged)
 # =============================================================================
 def main():
     apply_custom_theme(st.session_state.primary_color, st.session_state.secondary_color)
