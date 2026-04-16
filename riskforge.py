@@ -197,120 +197,119 @@ def clean_division_name(filename: str) -> str:
     name = re.sub(r"\s+", " ", name)
     return name.title() if name else "Unknown Division"
 
-def clean_division_value(val: str) -> str:
+def clean_division_value(val: Any) -> str:
     text = normalize_text(val)
     if not text:
         return ""
 
-    # remove obvious labels accidentally captured
-    text = re.sub(r"^(division\/dept|division|department|dept|directorate|function|unit)\s*[:\-]?\s*", "", text, flags=re.I)
+    text = re.sub(
+        r"^(division\/dept|division|department|dept|directorate|function|unit)\s*[:\-]?\s*",
+        "",
+        text,
+        flags=re.I
+    )
     text = re.sub(r"\s+", " ", text).strip(" :-")
 
-    # normalize common variants
-    mapping = {
+    # Only map very common abbreviations
+    abbrev_map = {
         "hr": "Human Resources",
-        "human resource": "Human Resources",
-        "human resources": "Human Resources",
-        "ict": "Information Technology",
         "it": "Information Technology",
-        "finance": "Finance",
-        "legal": "Legal",
-        "strategy": "Strategy",
-        "research": "Research",
-        "office support": "Office Support",
-        "facilities": "Facilities",
-        "nanomaterials": "Nanomaterials",
-        "nano": "Nanomaterials",
+        "ict": "Information Technology",
+        "ist": "Information Systems Technology",   # optional: you can remove if you prefer "Ist"
     }
 
     key = text.lower()
-    if key in mapping:
-        return mapping[key]
+    if key in abbrev_map:
+        return abbrev_map[key]
 
     return text.title()
 
-def detect_explicit_division(ws, scan_rows: int = 15, scan_cols: int = 15) -> Optional[str]:
-    """
-    Robust division detection:
-    - scans a larger header zone
-    - supports merged cells
-    - checks right, below, and nearby cells
-    - supports more header labels
-    """
-    label_patterns = [
-        "division/dept",
-        "division",
-        "department",
-        "dept",
-        "directorate",
-        "function",
-        "unit",
-    ]
+def looks_like_category(text: str) -> bool:
+    categories = {
+        "strategic",
+        "financial",
+        "operational",
+        "compliance/legal",
+        "people/hr",
+        "ict/cyber",
+        "reputational",
+        "health/safety",
+        "environmental",
+        "legal",
+        "hr",
+        "uncategorised",
+    }
+    return normalize_text(text).lower() in categories
 
-    for r in range(1, min(scan_rows, ws.max_row) + 1):
+def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: int = 12) -> Optional[str]:
+    """
+    Detect real division/dept from the metadata area ABOVE the table header.
+    Avoid picking category values like Strategic or Financial.
+    """
+    label_regex = re.compile(
+        r"^(division\/dept|division|department|dept|directorate|function|unit)\s*[:\-]?$",
+        re.I
+    )
+
+    max_row_to_scan = max(1, (header_row - 1) if header_row else 12)
+    max_row_to_scan = min(max_row_to_scan, 15)
+
+    for r in range(1, max_row_to_scan + 1):
         for c in range(1, min(scan_cols, ws.max_column) + 1):
-            label = normalize_text(merged_cell_value(ws, r, c)).lower()
+            label = normalize_text(merged_cell_value(ws, r, c))
             if not label:
                 continue
 
-            if any(p in label for p in label_patterns):
+            if label_regex.match(label):
                 candidates = []
 
-                # same row nearby cells
-                for offset in range(1, 5):
+                # same row, nearby right cells
+                for offset in range(1, 6):
                     candidates.append(merged_cell_value(ws, r, c + offset))
 
-                # below cells
-                for offset in range(1, 4):
-                    candidates.append(merged_cell_value(ws, r + offset, c))
-
-                # diagonal / nearby
-                for ro in range(1, 3):
-                    for co in range(1, 4):
-                        candidates.append(merged_cell_value(ws, r + ro, c + co))
+                # next row, same col and nearby right cells
+                for offset in range(0, 6):
+                    candidates.append(merged_cell_value(ws, r + 1, c + offset))
 
                 for cand in candidates:
                     cand_text = clean_division_value(cand)
-                    if cand_text and len(cand_text) > 2:
-                        lower = cand_text.lower()
+                    if not cand_text:
+                        continue
+                    if len(cand_text) < 3:
+                        continue
+                    if looks_like_category(cand_text):
+                        continue
 
-                        # reject obvious non-division values
-                        reject_terms = [
-                            "risk register",
-                            "updated",
-                            "august",
-                            "2025",
-                            "objective",
-                            "risk description",
-                            "risk definition",
-                            "cause",
-                            "controls",
-                            "owner",
-                        ]
-                        if not any(term in lower for term in reject_terms):
-                            return cand_text
+                    reject_terms = [
+                        "risk register",
+                        "risk description",
+                        "risk definition",
+                        "risk category",
+                        "impact",
+                        "likelihood",
+                        "inherent risk",
+                        "controls",
+                        "owner",
+                        "cause",
+                        "objective",
+                        "updated",
+                    ]
+                    if any(term in cand_text.lower() for term in reject_terms):
+                        continue
+
+                    return cand_text
 
     return None
 
 def extract_division_from_sheet_context(file_name: str, sheet_name: str, header_preview: List[str]) -> str:
-    combined = " ".join([file_name, sheet_name] + header_preview).lower()
-
-    mappings = {
-        "human resources": ["human resources", "hr risk register"],
-        "information technology": ["information technology", "it risk register", "ict risk register"],
-        "finance": ["finance risk register", "financial risk register"],
-        "legal": ["legal risk register"],
-        "research": ["research risk register"],
-        "office support": ["office support risk register"],
-        "facilities": ["facilities risk register"],
-        "strategy": ["strategy risk register", "strategic planning risk register"],
-        "nanomaterials": ["nano risk register", "nanomaterials risk register"],
-    }
-
-    for division, keywords in mappings.items():
-        if any(keyword in combined for keyword in keywords):
-            return division.title()
-
+    # Use only the filename/sheetname as the fallback division.
+    # Remove "risk register" and similar suffixes.
+    name = sheet_name if sheet_name else file_name
+    name = re.sub(r"(?i)\brisk\s*register\b", "", name)
+    name = re.sub(r"(?i)\bconsolidated\b", "", name)
+    name = re.sub(r"[_\-\s]+", " ", name).strip()
+    if name:
+        return name.title()
     return clean_division_name(file_name)
 
 def parse_risk_score(val: Any) -> Optional[float]:
@@ -601,7 +600,7 @@ def parse_structured_sheet(
 
     header_preview = [normalize_text(merged_cell_value(ws, header_row, c)) for c in range(1, min(ws.max_column, 20) + 1)]
 
-    explicit_division = detect_explicit_division(ws)
+    explicit_division = detect_explicit_division(ws, header_row=header_row)
     if explicit_division:
         division_name = explicit_division
     else:
@@ -1713,8 +1712,12 @@ def main():
     apply_custom_theme(st.session_state.primary_color, st.session_state.secondary_color)
     render_sidebar()
 
-    # Premium Hero Header
-    health = st.session_state.rf_data.get("enterprise_health_score", 0) if st.session_state.rf_data else 0
+    # Premium Hero Header (updates automatically after parsing)
+    if st.session_state.rf_data:
+        health = st.session_state.rf_data.get("enterprise_health_score", 0)
+    else:
+        health = 0
+
     if health >= 80:
         posture, posture_color, posture_bg = "Strong", "#10b981", "#d1fae5"
     elif health >= 60:
