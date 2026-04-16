@@ -197,22 +197,120 @@ def clean_division_name(filename: str) -> str:
     name = re.sub(r"\s+", " ", name)
     return name.title() if name else "Unknown Division"
 
+def clean_division_value(val: str) -> str:
+    text = normalize_text(val)
+    if not text:
+        return ""
+
+    # remove obvious labels accidentally captured
+    text = re.sub(r"^(division\/dept|division|department|dept|directorate|function|unit)\s*[:\-]?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" :-")
+
+    # normalize common variants
+    mapping = {
+        "hr": "Human Resources",
+        "human resource": "Human Resources",
+        "human resources": "Human Resources",
+        "ict": "Information Technology",
+        "it": "Information Technology",
+        "finance": "Finance",
+        "legal": "Legal",
+        "strategy": "Strategy",
+        "research": "Research",
+        "office support": "Office Support",
+        "facilities": "Facilities",
+        "nanomaterials": "Nanomaterials",
+        "nano": "Nanomaterials",
+    }
+
+    key = text.lower()
+    if key in mapping:
+        return mapping[key]
+
+    return text.title()
+
+def detect_explicit_division(ws, scan_rows: int = 15, scan_cols: int = 15) -> Optional[str]:
+    """
+    Robust division detection:
+    - scans a larger header zone
+    - supports merged cells
+    - checks right, below, and nearby cells
+    - supports more header labels
+    """
+    label_patterns = [
+        "division/dept",
+        "division",
+        "department",
+        "dept",
+        "directorate",
+        "function",
+        "unit",
+    ]
+
+    for r in range(1, min(scan_rows, ws.max_row) + 1):
+        for c in range(1, min(scan_cols, ws.max_column) + 1):
+            label = normalize_text(merged_cell_value(ws, r, c)).lower()
+            if not label:
+                continue
+
+            if any(p in label for p in label_patterns):
+                candidates = []
+
+                # same row nearby cells
+                for offset in range(1, 5):
+                    candidates.append(merged_cell_value(ws, r, c + offset))
+
+                # below cells
+                for offset in range(1, 4):
+                    candidates.append(merged_cell_value(ws, r + offset, c))
+
+                # diagonal / nearby
+                for ro in range(1, 3):
+                    for co in range(1, 4):
+                        candidates.append(merged_cell_value(ws, r + ro, c + co))
+
+                for cand in candidates:
+                    cand_text = clean_division_value(cand)
+                    if cand_text and len(cand_text) > 2:
+                        lower = cand_text.lower()
+
+                        # reject obvious non-division values
+                        reject_terms = [
+                            "risk register",
+                            "updated",
+                            "august",
+                            "2025",
+                            "objective",
+                            "risk description",
+                            "risk definition",
+                            "cause",
+                            "controls",
+                            "owner",
+                        ]
+                        if not any(term in lower for term in reject_terms):
+                            return cand_text
+
+    return None
+
 def extract_division_from_sheet_context(file_name: str, sheet_name: str, header_preview: List[str]) -> str:
     combined = " ".join([file_name, sheet_name] + header_preview).lower()
+
     mappings = {
-        "human resources": ["human resources", "hr risk register", "hr "],
-        "information technology": ["information technology", "it risk register", "ict"],
-        "finance": ["finance", "financial"],
-        "legal": ["legal"],
-        "strategy": ["strategy", "strategic planning"],
-        "research": ["research"],
-        "office support": ["office support"],
-        "facilities": ["facilities"],
-        "risk management": ["risk monitoring", "risk register"],
+        "human resources": ["human resources", "hr risk register"],
+        "information technology": ["information technology", "it risk register", "ict risk register"],
+        "finance": ["finance risk register", "financial risk register"],
+        "legal": ["legal risk register"],
+        "research": ["research risk register"],
+        "office support": ["office support risk register"],
+        "facilities": ["facilities risk register"],
+        "strategy": ["strategy risk register", "strategic planning risk register"],
+        "nanomaterials": ["nano risk register", "nanomaterials risk register"],
     }
+
     for division, keywords in mappings.items():
         if any(keyword in combined for keyword in keywords):
             return division.title()
+
     return clean_division_name(file_name)
 
 def parse_risk_score(val: Any) -> Optional[float]:
@@ -502,7 +600,12 @@ def parse_structured_sheet(
     row_audit: List[Dict[str, Any]] = []
 
     header_preview = [normalize_text(merged_cell_value(ws, header_row, c)) for c in range(1, min(ws.max_column, 20) + 1)]
-    division_name = extract_division_from_sheet_context(file_name, sheet_name, header_preview)
+
+    explicit_division = detect_explicit_division(ws)
+    if explicit_division:
+        division_name = explicit_division
+    else:
+        division_name = extract_division_from_sheet_context(file_name, sheet_name, header_preview)
 
     def get_field(row_idx: int, field_name: str) -> Any:
         col_idx = col_map.get(field_name)
@@ -1341,11 +1444,155 @@ def create_treatment_gauge(confidence: float) -> go.Figure:
 def apply_custom_theme(primary: str, secondary: str) -> None:
     st.markdown(f"""
     <style>
-    :root {{ --p-color: {primary}; --s-color: {secondary}; }}
-    .metric-card {{ background:white; border-radius:12px; padding:1rem; border-top:4px solid var(--p-color); box-shadow:0 2px 8px rgba(0,0,0,0.05); }}
-    .metric-label {{ font-size:0.8rem; color:#6B7A8A; }}
-    .metric-value {{ font-size:1.8rem; font-weight:800; color:#12384D; }}
-    .stButton > button {{ background: var(--p-color) !important; color:white !important; border-radius:10px !important; }}
+    body, .stApp {{
+        background-color: #f9fafb;
+    }}
+    .stTabs [data-baseweb="tab-list"] {{
+        gap: 8px;
+        background-color: transparent;
+    }}
+    .stTabs [data-baseweb="tab"] {{
+        border-radius: 12px 12px 0 0;
+        padding: 12px 24px;
+        background-color: white;
+        border: 1px solid #e2e8f0;
+        border-bottom: none;
+        font-weight: 600;
+        color: #475569;
+    }}
+    .stTabs [aria-selected="true"] {{
+        background-color: {primary} !important;
+        color: white !important;
+        border-color: {primary} !important;
+    }}
+    .stButton > button {{
+        background: linear-gradient(145deg, {primary} 0%, {secondary} 100%);
+        color: white;
+        border: none;
+        border-radius: 40px;
+        padding: 12px 28px;
+        font-weight: 600;
+        transition: all 0.2s;
+        box-shadow: 0 4px 12px rgba(14, 54, 92, 0.2);
+        border: none;
+    }}
+    .stButton > button:hover {{
+        transform: translateY(-2px);
+        box-shadow: 0 8px 20px rgba(14, 54, 92, 0.3);
+    }}
+    .exec-card {{
+        background: #ffffff;
+        border-radius: 20px;
+        padding: 22px 24px;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
+        border: 1px solid rgba(14, 54, 92, 0.08);
+        margin-bottom: 20px;
+    }}
+    .exec-card-header {{
+        display: flex;
+        align-items: center;
+        margin-bottom: 18px;
+        border-bottom: 1px solid #eef2f6;
+        padding-bottom: 14px;
+    }}
+    .exec-card-title {{
+        font-size: 1.2rem;
+        font-weight: 700;
+        color: {primary};
+        letter-spacing: -0.01em;
+    }}
+    .exec-badge {{
+        display: inline-block;
+        padding: 6px 14px;
+        border-radius: 40px;
+        font-size: 0.8rem;
+        font-weight: 700;
+        letter-spacing: 0.2px;
+        text-transform: uppercase;
+    }}
+    .exec-metric-row {{
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 14px;
+    }}
+    .exec-metric-label {{
+        color: #475569;
+        font-size: 0.95rem;
+    }}
+    .exec-metric-value {{
+        font-weight: 700;
+        color: #0f172a;
+        font-size: 1.1rem;
+    }}
+    .exec-divider {{
+        height: 1px;
+        background: #e2e8f0;
+        margin: 18px 0;
+    }}
+    .exec-risk-card {{
+        background: #f8fafc;
+        border-radius: 16px;
+        padding: 16px 20px;
+        margin-bottom: 12px;
+        border-left: 6px solid;
+    }}
+    .exec-hero {{
+        background: linear-gradient(145deg, {primary} 0%, {secondary} 100%);
+        border-radius: 28px;
+        padding: 28px 32px;
+        color: white;
+        margin-bottom: 24px;
+        box-shadow: 0 12px 32px rgba(14, 54, 92, 0.2);
+    }}
+    .exec-ai-brief {{
+        background: #f1f5f9;
+        border-radius: 18px;
+        padding: 20px 24px;
+        border-left: 8px solid {primary};
+        margin-bottom: 24px;
+    }}
+    .kpi-card {{
+        background: white;
+        border-radius: 16px;
+        padding: 18px 16px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.04);
+        border: 1px solid #edf2f7;
+        height: 100%;
+    }}
+    .kpi-label {{
+        color: #64748b;
+        font-size: 0.9rem;
+        font-weight: 500;
+        letter-spacing: 0.3px;
+        margin-bottom: 8px;
+    }}
+    .kpi-value {{
+        color: #0f172a;
+        font-size: 2.2rem;
+        font-weight: 700;
+        line-height: 1.2;
+    }}
+    .register-table {{
+        width: 100%;
+        border-collapse: collapse;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        font-size: 13px;
+    }}
+    .register-table th {{
+        background-color: #f3f4f6;
+        color: #1f2937;
+        font-weight: 600;
+        border-bottom: 2px solid #d1d5db;
+        padding: 10px 8px;
+        text-align: left;
+        border-right: 1px solid #e5e7eb;
+    }}
+    .register-table td {{
+        padding: 8px;
+        border-right: 1px solid #e5e7eb;
+        border-bottom: 1px solid #e5e7eb;
+        vertical-align: top;
+    }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -1466,16 +1713,49 @@ def main():
     apply_custom_theme(st.session_state.primary_color, st.session_state.secondary_color)
     render_sidebar()
 
-    col_logo, col_text = st.columns([1, 5])
+    # Premium Hero Header
+    health = st.session_state.rf_data.get("enterprise_health_score", 0) if st.session_state.rf_data else 0
+    if health >= 80:
+        posture, posture_color, posture_bg = "Strong", "#10b981", "#d1fae5"
+    elif health >= 60:
+        posture, posture_color, posture_bg = "Stable", "#3b82f6", "#dbeafe"
+    elif health >= 40:
+        posture, posture_color, posture_bg = "Elevated", "#f59e0b", "#fef3c7"
+    else:
+        posture, posture_color, posture_bg = "Critical", "#ef4444", "#fee2e2"
+
+    col_logo, col_hero = st.columns([0.5, 5])
     with col_logo:
         if st.session_state.logo_bytes:
             st.image(st.session_state.logo_bytes, width=60)
         else:
             st.markdown("### 🛡️")
-    with col_text:
-        st.title(st.session_state.org_name)
-        st.caption(st.session_state.report_title)
-    
+    with col_hero:
+        st.markdown(f"""
+        <div class="exec-hero" style="margin-top: 0;">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                <div>
+                    <div style="font-size: 14px; opacity: 0.85; letter-spacing: 0.5px;">
+                        {st.session_state.org_name.upper()}
+                    </div>
+                    <div style="font-size: 36px; font-weight: 700; margin-top: 8px; line-height: 1.1;">
+                        {st.session_state.report_title}
+                    </div>
+                    <div style="margin-top: 12px; font-size: 16px; opacity: 0.9;">
+                        Reporting Period: Q{((datetime.now().month-1)//3)+1} {datetime.now().year} • Board Date: {datetime.now().strftime('%B %d, %Y')}
+                    </div>
+                </div>
+                <div style="text-align: right;">
+                    <div style="font-size: 14px; opacity: 0.8;">ENTERPRISE HEALTH</div>
+                    <div style="font-size: 56px; font-weight: 800; line-height: 1;">{health}</div>
+                    <div style="background: {posture_bg}; color: {posture_color}; padding: 6px 16px; border-radius: 40px; font-weight: 700; font-size: 16px; margin-top: 8px; display: inline-block;">
+                        {posture} POSTURE
+                    </div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
     render_parser_audit_panel()
     
     if GEMINI_AVAILABLE:
@@ -1566,14 +1846,51 @@ def main():
         data = st.session_state.rf_data
         df = data["risks_df"]
         tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "📑 Register", "🧠 Intelligence", "📈 Trends", "📤 Export"])
+        
         with tab1:
             st.subheader("Executive Dashboard")
             col1, col2, col3, col4, col5 = st.columns(5)
-            col1.metric("Total Risks", data["total_risks"])
-            col2.metric("Critical+High", data["critical_count"] + data["high_count"])
-            col3.metric("Health Score", f"{data['enterprise_health_score']}/100")
-            col4.metric("Treatment Confidence", f"{data.get('treatment_confidence', 0)}%")
-            col5.metric("Top Division", f"{data['top_division']} ({data['top_division_pct']}%)")
+            with col1:
+                st.markdown(f"""
+                <div class="kpi-card">
+                    <div class="kpi-label">📋 Total Risks</div>
+                    <div class="kpi-value">{data['total_risks']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with col2:
+                st.markdown(f"""
+                <div class="kpi-card">
+                    <div class="kpi-label">⚠️ Critical + High</div>
+                    <div class="kpi-value">{data['critical_count'] + data['high_count']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with col3:
+                health_val = data['enterprise_health_score']
+                health_color = "#10b981" if health_val >= 80 else "#3b82f6" if health_val >= 60 else "#f59e0b" if health_val >= 40 else "#ef4444"
+                st.markdown(f"""
+                <div class="kpi-card">
+                    <div class="kpi-label">❤️ Health Score</div>
+                    <div class="kpi-value" style="color: {health_color};">{health_val}/100</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with col4:
+                conf = data.get('treatment_confidence', 0)
+                conf_color = "#10b981" if conf >= 75 else "#f59e0b" if conf >= 50 else "#ef4444"
+                st.markdown(f"""
+                <div class="kpi-card">
+                    <div class="kpi-label">🛠️ Treatment Confidence</div>
+                    <div class="kpi-value" style="color: {conf_color};">{conf}%</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with col5:
+                st.markdown(f"""
+                <div class="kpi-card">
+                    <div class="kpi-label">🏢 Top Division</div>
+                    <div class="kpi-value" style="font-size: 1.3rem;">{data['top_division']}</div>
+                    <div style="color: #64748b; font-size: 0.8rem;">{data['top_division_pct']}% of load</div>
+                </div>
+                """, unsafe_allow_html=True)
+
             col_chart1, col_chart2 = st.columns(2)
             with col_chart1:
                 if not df.empty:
@@ -1597,136 +1914,104 @@ def main():
         
         with tab2:
             st.subheader("Enterprise Risk Register")
-            # Add appetite breach highlighting
-            def highlight_appetite(row):
-                threshold = data.get("threshold", st.session_state.board_threshold)
-                category_appetite = st.session_state.category_appetite if st.session_state.tier == "enterprise" else {}
-                band = appetite_band(row["residual_score"], threshold, row.get("category", ""), category_appetite)
+
+            register_cols = [
+                "division",
+                "risk_no",
+                "risk_name",
+                "risk_statement",
+                "cause",
+                "category",
+                "impact_score",
+                "likelihood_score",
+                "inherent_score",
+                "controls",
+                "control_effectiveness",
+                "owner",
+                "strategy",
+                "treatment_plan",
+                "due_date_raw",
+                "residual_score",
+                "residual_level",
+            ]
+
+            display_df = df.copy()
+            display_df = display_df[[c for c in register_cols if c in display_df.columns]]
+
+            display_df = display_df.rename(columns={
+                "division": "Division/Dept",
+                "risk_no": "Risk No",
+                "risk_name": "Risk Description",
+                "risk_statement": "Risk Definition/Statement",
+                "cause": "Cause",
+                "category": "Risk Category",
+                "impact_score": "Impact (1-5)",
+                "likelihood_score": "Likelihood (1-5)",
+                "inherent_score": "Inherent Risk",
+                "controls": "Controls",
+                "control_effectiveness": "Control Effectiveness",
+                "owner": "Risk Owner",
+                "strategy": "Risk Strategy",
+                "treatment_plan": "Risk Treatment/Action Plan",
+                "due_date_raw": "Treatment Due Date",
+                "residual_score": "Residual Risk",
+                "residual_level": "Residual Level",
+            })
+
+            threshold = data.get("threshold", st.session_state.board_threshold)
+            category_appetite = st.session_state.category_appetite if st.session_state.tier == "enterprise" else {}
+
+            html_table = '<table class="register-table">'
+            html_table += '<thead><tr>'
+            for col in display_df.columns:
+                html_table += f'<th>{col}</th>'
+            html_table += '</tr></thead><tbody>'
+
+            for _, row in display_df.iterrows():
+                band = appetite_band(row["Residual Risk"], threshold, row.get("Risk Category", ""), category_appetite)
                 if band in ["breached", "critical breach"]:
-                    return ['background-color: #fee2e2'] * len(row)
+                    row_bg = "#fee2e2"
                 elif band == "near appetite":
-                    return ['background-color: #fef3c7'] * len(row)
+                    row_bg = "#fef3c7"
+                elif band == "within appetite":
+                    row_bg = "#dcfce7"
                 else:
-                    return [''] * len(row)
-            
-            styled_df = df.style.apply(highlight_appetite, axis=1)
-            st.dataframe(styled_df, use_container_width=True)
-        
+                    row_bg = "#ffffff"
+
+                html_table += f'<tr style="background-color: {row_bg};">'
+                for col_name, value in row.items():
+                    cell_style = ""
+                    if col_name in ["Inherent Risk", "Residual Risk"]:
+                        try:
+                            score = float(value)
+                            if score >= 20:
+                                cell_style = "background-color: #dc2626; color: white; font-weight: 700;"
+                            elif score >= 12:
+                                cell_style = "background-color: #f59e0b; color: white; font-weight: 700;"
+                            elif score >= 6:
+                                cell_style = "background-color: #fef3c7; color: #92400e; font-weight: 600;"
+                            else:
+                                cell_style = "background-color: #dcfce7; color: #166534; font-weight: 600;"
+                        except:
+                            pass
+                    elif col_name in ["Impact (1-5)", "Likelihood (1-5)"]:
+                        try:
+                            val = float(value)
+                            if val >= 4:
+                                cell_style = "background-color: #fca5a5; font-weight: 600;"
+                            elif val >= 3:
+                                cell_style = "background-color: #fde68a; font-weight: 600;"
+                        except:
+                            pass
+
+                    display_val = str(value) if pd.notna(value) else ""
+                    html_table += f'<td style="{cell_style}">{display_val}</td>'
+                html_table += '</tr>'
+            html_table += '</tbody></table>'
+
+            st.markdown(html_table, unsafe_allow_html=True)
+
         with tab3:
-            # -----------------------------------------------------------------
-            # Premium Executive Board Pack Styling
-            # -----------------------------------------------------------------
-            st.markdown("""
-            <style>
-            .exec-card {
-                background: #ffffff;
-                border-radius: 20px;
-                padding: 22px 24px;
-                box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
-                border: 1px solid rgba(14, 54, 92, 0.08);
-                margin-bottom: 20px;
-            }
-            .exec-card-header {
-                display: flex;
-                align-items: center;
-                margin-bottom: 18px;
-                border-bottom: 1px solid #eef2f6;
-                padding-bottom: 14px;
-            }
-            .exec-card-title {
-                font-size: 1.2rem;
-                font-weight: 700;
-                color: #0E365C;
-                letter-spacing: -0.01em;
-            }
-            .exec-badge {
-                display: inline-block;
-                padding: 6px 14px;
-                border-radius: 40px;
-                font-size: 0.8rem;
-                font-weight: 700;
-                letter-spacing: 0.2px;
-                text-transform: uppercase;
-            }
-            .exec-metric-row {
-                display: flex;
-                justify-content: space-between;
-                margin-bottom: 14px;
-            }
-            .exec-metric-label {
-                color: #475569;
-                font-size: 0.95rem;
-            }
-            .exec-metric-value {
-                font-weight: 700;
-                color: #0f172a;
-                font-size: 1.1rem;
-            }
-            .exec-divider {
-                height: 1px;
-                background: #e2e8f0;
-                margin: 18px 0;
-            }
-            .exec-risk-card {
-                background: #f8fafc;
-                border-radius: 16px;
-                padding: 16px 20px;
-                margin-bottom: 12px;
-                border-left: 6px solid;
-            }
-            .exec-hero {
-                background: linear-gradient(145deg, #0E365C 0%, #1A5F7A 100%);
-                border-radius: 28px;
-                padding: 28px 32px;
-                color: white;
-                margin-bottom: 24px;
-                box-shadow: 0 12px 32px rgba(14, 54, 92, 0.2);
-            }
-            .exec-ai-brief {
-                background: #f1f5f9;
-                border-radius: 18px;
-                padding: 20px 24px;
-                border-left: 8px solid #0E365C;
-                margin-bottom: 24px;
-            }
-            </style>
-            """, unsafe_allow_html=True)
-
-            health = data.get("enterprise_health_score", 0)
-            if health >= 80:
-                posture, posture_color, posture_bg = "Strong", "#10b981", "#d1fae5"
-            elif health >= 60:
-                posture, posture_color, posture_bg = "Stable", "#3b82f6", "#dbeafe"
-            elif health >= 40:
-                posture, posture_color, posture_bg = "Elevated", "#f59e0b", "#fef3c7"
-            else:
-                posture, posture_color, posture_bg = "Critical", "#ef4444", "#fee2e2"
-
-            st.markdown(f"""
-            <div class="exec-hero">
-                <div style="display: flex; justify-content: space-between; align-items: flex-start;">
-                    <div>
-                        <div style="font-size: 14px; opacity: 0.85; letter-spacing: 0.5px;">
-                            {data.get("company", st.session_state.org_name).upper()}
-                        </div>
-                        <div style="font-size: 36px; font-weight: 700; margin-top: 8px; line-height: 1.1;">
-                            {data.get("report_title", st.session_state.report_title)}
-                        </div>
-                        <div style="margin-top: 12px; font-size: 16px; opacity: 0.9;">
-                            {data.get("period", f"Q{((datetime.now().month-1)//3)+1} {datetime.now().year}")} • Board Date: {data.get("board_date", datetime.now().strftime('%B %d, %Y'))}
-                        </div>
-                    </div>
-                    <div style="text-align: right;">
-                        <div style="font-size: 14px; opacity: 0.8;">ENTERPRISE HEALTH</div>
-                        <div style="font-size: 56px; font-weight: 800; line-height: 1;">{health}</div>
-                        <div style="background: {posture_bg}; color: {posture_color}; padding: 6px 16px; border-radius: 40px; font-weight: 700; font-size: 16px; margin-top: 8px; display: inline-block;">
-                            {posture} POSTURE
-                        </div>
-                    </div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
             if data.get("ai_summary"):
                 st.markdown(f"""
                 <div class="exec-ai-brief">
