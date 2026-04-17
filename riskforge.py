@@ -839,7 +839,7 @@ def parse_structured_risk_register(
     default_residual: int
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     debug_info: Dict[str, Any] = {
-        "parser": "intelligent_structured_v10",
+        "parser": "intelligent_structured_v11",
         "candidate_sheets": [],
         "selected_sheets": [],
         "error": None,
@@ -1006,34 +1006,41 @@ def parse_uploaded_file_bytes(
     return pd.DataFrame(), debug
 
 # =============================================================================
-# ENTERPRISE REGISTER BUILDING (WITH CONTROLS & TREATMENT)
+# ENTERPRISE REGISTER BUILDING (WITH SAFE COLUMN ACCESS)
 # =============================================================================
 def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if raw_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    statements = raw_df["risk_statement"].fillna("").tolist()
-    names = raw_df["risk_name"].fillna("").tolist()
-    divisions = raw_df["division"].tolist()
-    categories = raw_df["category"].tolist()
-    inherent_scores = raw_df["inherent_score"].tolist()
-    residual_scores = raw_df["residual_score"].tolist()
-    impact_scores = raw_df["impact_score"].tolist()
-    likelihood_scores = raw_df["likelihood_score"].tolist()
-    owners = raw_df["owner"].tolist()
-    strategies = raw_df["strategy"].tolist()
-    treatments = raw_df["treatment_plan"].tolist()
-    statuses = raw_df["status"].tolist()
-    due_dates = raw_df["due_date"].tolist()
-    controls_list = raw_df["controls"].tolist()
-    control_eff_texts = raw_df["control_effectiveness"].tolist()
-    control_eff_factors = raw_df["control_effectiveness_factor"].tolist()
-    acceptance_scores = raw_df["acceptance_score"].tolist()
-    parser_confidences = raw_df["parser_confidence"].tolist()
-    division_confidences = raw_df["division_confidence"].tolist()
-    source_files = raw_df["source_file"].tolist()
-    source_sheets = raw_df["source_sheet"].tolist()
-    source_rows = raw_df["source_row"].tolist()
+    # Helper to safely get column as list
+    def safe_col(col_name, default_val=None):
+        if col_name in raw_df.columns:
+            return raw_df[col_name].fillna(default_val).tolist()
+        else:
+            return [default_val] * len(raw_df)
+
+    statements = safe_col("risk_statement", "")
+    names = safe_col("risk_name", "")
+    divisions = safe_col("division", "Unknown Division")
+    categories = safe_col("category", "Uncategorised")
+    inherent_scores = safe_col("inherent_score", 0)
+    residual_scores = safe_col("residual_score", 0)
+    impact_scores = safe_col("impact_score", 3.0)
+    likelihood_scores = safe_col("likelihood_score", 3.0)
+    owners = safe_col("owner", "Not assigned")
+    strategies = safe_col("strategy", "Treat")
+    treatments = safe_col("treatment_plan", "")
+    statuses = safe_col("status", "Active")
+    due_dates = safe_col("due_date", None)
+    controls_list = safe_col("controls", "")
+    control_eff_texts = safe_col("control_effectiveness", "Not rated")
+    control_eff_factors = safe_col("control_effectiveness_factor", None)
+    acceptance_scores = safe_col("acceptance_score", 0)
+    parser_confidences = safe_col("parser_confidence", 0.6)
+    division_confidences = safe_col("division_confidence", 0.5)
+    source_files = safe_col("source_file", "")
+    source_sheets = safe_col("source_sheet", "")
+    source_rows = safe_col("source_row", 0)
 
     clusters = []
     used = set()
@@ -1081,9 +1088,9 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         ]
 
         avg_similarity = sum(similarities) / len(similarities) if similarities else 0
-        acceptance_avg = sum(cluster_acceptance) / len(cluster_acceptance)
-        parser_conf_avg = sum(cluster_parser_conf) / len(cluster_parser_conf)
-        div_conf_avg = sum(cluster_div_conf) / len(cluster_div_conf)
+        acceptance_avg = sum(cluster_acceptance) / len(cluster_acceptance) if cluster_acceptance else 0
+        parser_conf_avg = sum(cluster_parser_conf) / len(cluster_parser_conf) if cluster_parser_conf else 0
+        div_conf_avg = sum(cluster_div_conf) / len(cluster_div_conf) if cluster_div_conf else 0
 
         unique_divs = set(cluster_divisions)
         div_consistency = 1.0 if len(unique_divs) == 1 else 0.6 if len(unique_divs) <= 2 else 0.3
@@ -1101,16 +1108,16 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         ) * 100
         cluster_confidence = round(min(100, cluster_confidence))
 
-        canonical_name = max(cluster_names, key=len)
-        canonical_stmt = max(cluster_stmts, key=len)
+        canonical_name = max(cluster_names, key=len) if cluster_names else "Unnamed Risk"
+        canonical_stmt = max(cluster_stmts, key=len) if cluster_stmts else ""
         div_counts = pd.Series(cluster_divisions).value_counts()
         primary_division = div_counts.index[0] if not div_counts.empty else "Unknown Division"
         cat_counts = pd.Series(cluster_categories).value_counts()
         primary_category = cat_counts.index[0] if not cat_counts.empty else "Uncategorised"
         max_residual = max(cluster_residuals) if cluster_residuals else 0
-        avg_inherent = round(sum(cluster_inherents) / len(cluster_inherents), 1)
-        avg_impact = round(sum(cluster_impacts) / len(cluster_impacts), 1)
-        avg_likelihood = round(sum(cluster_likelihoods) / len(cluster_likelihoods), 1)
+        avg_inherent = round(sum(cluster_inherents) / len(cluster_inherents), 1) if cluster_inherents else 0
+        avg_impact = round(sum(cluster_impacts) / len(cluster_impacts), 1) if cluster_impacts else 0
+        avg_likelihood = round(sum(cluster_likelihoods) / len(cluster_likelihoods), 1) if cluster_likelihoods else 0
         all_owners = ", ".join(sorted(set(o for o in cluster_owners if o.lower() != "not assigned"))) or "Not assigned"
         primary_owner = cluster_owners[0] if cluster_owners else "Not assigned"
         all_divisions_str = ", ".join(sorted(unique_divs))
@@ -1190,9 +1197,10 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         })
 
     enterprise_df = pd.DataFrame(enterprise_rows)
-    enterprise_df["residual_level"] = enterprise_df["residual_score"].apply(
-        lambda x: "Critical" if x >= 20 else "High" if x >= 12 else "Medium" if x >= 6 else "Low"
-    )
+    if not enterprise_df.empty:
+        enterprise_df["residual_level"] = enterprise_df["residual_score"].apply(
+            lambda x: "Critical" if x >= 20 else "High" if x >= 12 else "Medium" if x >= 6 else "Low"
+        )
     clusters_detail_df = pd.DataFrame(clusters_detail)
     return enterprise_df, clusters_detail_df
 
