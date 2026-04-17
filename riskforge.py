@@ -839,7 +839,7 @@ def parse_structured_risk_register(
     default_residual: int
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     debug_info: Dict[str, Any] = {
-        "parser": "intelligent_structured_v11",
+        "parser": "intelligent_structured_v12",
         "candidate_sheets": [],
         "selected_sheets": [],
         "error": None,
@@ -1982,35 +1982,76 @@ def main():
 
         with tab2:
             st.subheader("Enterprise Risk Register")
-            display_df = enterprise_df[[
-                "enterprise_risk_id", "risk_name", "risk_statement", "primary_division", "all_contributing_divisions",
-                "primary_category", "inherent_score", "residual_score", "impact_pre", "likelihood_pre",
-                "primary_owner", "all_owners", "primary_strategy", "primary_treatment_plan",
-                "earliest_due_date", "treatment_status", "primary_controls", "control_effectiveness",
-                "mitigation_strength_pct", "cluster_size", "cluster_confidence"
-            ]].rename(columns={
+
+            # Mapping dictionaries for impact/likelihood text
+            IMPACT_MAP = {5: "Critical", 4: "Major", 3: "Moderate", 2: "Significant", 1: "Minor"}
+            LIKELIHOOD_MAP = {5: "Almost Certain", 4: "Likely", 3: "Moderate", 2: "Unlikely", 1: "Rare"}
+            INHERENT_LEVEL_MAP = {
+                (20, 25): "High",
+                (12, 19): "High",
+                (6, 11): "Medium",
+                (1, 5): "Low"
+            }
+
+            def get_inherent_level(score):
+                for (low, high), label in INHERENT_LEVEL_MAP.items():
+                    if low <= score <= high:
+                        return label
+                return "Unknown"
+
+            # Create display dataframe with additional columns
+            display_df = enterprise_df.copy()
+
+            display_df["impact_text"] = display_df["impact_pre"].apply(lambda x: IMPACT_MAP.get(int(round(x)), "Unknown") if pd.notna(x) else "Unknown")
+            display_df["likelihood_text"] = display_df["likelihood_pre"].apply(lambda x: LIKELIHOOD_MAP.get(int(round(x)), "Unknown") if pd.notna(x) else "Unknown")
+            display_df["inherent_text"] = display_df["inherent_score"].apply(get_inherent_level)
+
+            # Select and order columns for display
+            display_cols = [
+                "enterprise_risk_id",
+                "risk_name",
+                "risk_statement",
+                "primary_division",
+                "primary_category",
+                "impact_text",
+                "impact_pre",
+                "likelihood_text",
+                "likelihood_pre",
+                "inherent_text",
+                "inherent_score",
+                "residual_score",
+                "primary_owner",
+                "primary_strategy",
+                "primary_treatment_plan",
+                "earliest_due_date",
+                "treatment_status",
+                "mitigation_strength_pct",
+                "cluster_confidence",
+            ]
+            display_cols = [c for c in display_cols if c in display_df.columns]
+
+            display_df = display_df[display_cols].rename(columns={
                 "enterprise_risk_id": "Risk ID",
                 "risk_name": "Risk Name",
                 "risk_statement": "Risk Statement",
-                "primary_division": "Primary Division",
-                "all_contributing_divisions": "Contributing Divisions",
+                "primary_division": "Division",
                 "primary_category": "Category",
-                "inherent_score": "Inherent",
-                "residual_score": "Residual",
-                "impact_pre": "Impact",
-                "likelihood_pre": "Likelihood",
-                "primary_owner": "Primary Owner",
-                "all_owners": "All Owners",
+                "impact_text": "IMPACT",
+                "impact_pre": "Impact (1-5)",
+                "likelihood_text": "LIKELIHOOD",
+                "likelihood_pre": "Likelihood (1-5)",
+                "inherent_text": "INHERENT RISK",
+                "inherent_score": "Inherent Score",
+                "residual_score": "Residual Score",
+                "primary_owner": "Owner",
                 "primary_strategy": "Strategy",
                 "primary_treatment_plan": "Treatment Plan",
                 "earliest_due_date": "Due Date",
                 "treatment_status": "Status",
-                "primary_controls": "Controls",
-                "control_effectiveness": "Control Eff.",
                 "mitigation_strength_pct": "Mitigation %",
-                "cluster_size": "Sources",
-                "cluster_confidence": "Confidence"
+                "cluster_confidence": "Confidence",
             })
+
             threshold = data.get("threshold", st.session_state.board_threshold)
             category_appetite = st.session_state.category_appetite if st.session_state.tier == "enterprise" else {}
 
@@ -2021,7 +2062,7 @@ def main():
             html_table += '</tr></thead><tbody>'
 
             for _, row in display_df.iterrows():
-                band = appetite_band(row["Residual"], threshold, row.get("Category", ""), category_appetite)
+                band = appetite_band(row["Residual Score"], threshold, row.get("Category", ""), category_appetite)
                 if band in ["breached", "critical breach"]:
                     row_bg = "#fee2e2"
                 elif band == "near appetite":
@@ -2050,7 +2091,7 @@ def main():
                             cell_style = "background-color: #dcfce7; color: #166534; font-weight: 600;"
                         elif "on track" in status_str or "active" in status_str:
                             cell_style = "background-color: #fef9c3; color: #854d0e; font-weight: 600;"
-                    elif col_name in ["Inherent", "Residual"]:
+                    elif col_name in ["Inherent Score", "Residual Score"]:
                         try:
                             score = float(value)
                             if score >= 20:
@@ -2074,6 +2115,13 @@ def main():
                                 cell_style = "background-color: #fee2e2; color: #991b1b; font-weight: 600;"
                         except:
                             pass
+                    elif col_name == "IMPACT" and str(value) == "Critical":
+                        cell_style = "background-color: #fee2e2; font-weight: 700;"
+                    elif col_name == "LIKELIHOOD" and str(value) == "Almost Certain":
+                        cell_style = "background-color: #fee2e2; font-weight: 700;"
+                    elif col_name == "INHERENT RISK" and str(value) == "High":
+                        cell_style = "background-color: #ffedd5; font-weight: 700;"
+
                     display_val = str(value) if pd.notna(value) else ""
                     html_table += f'<td style="{cell_style}">{display_val}</td>'
                 html_table += '</tr>'
