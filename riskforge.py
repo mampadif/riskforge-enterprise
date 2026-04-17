@@ -183,9 +183,28 @@ def parse_due_date(val: Any) -> Optional[date]:
         return parsed.date()
     return None
 
+def is_year_like(text: str) -> bool:
+    """Reject values like '2025-26', '2024/25', '2023 24'."""
+    if not text:
+        return False
+    t = text.strip()
+    patterns = [
+        r"^\d{4}[\-/ ]?\d{2}$",      # 2025-26, 2024/25, 2023 24
+        r"^\d{4}$",                  # 2025
+        r"^\d{2}[\-/]\d{2}$",        # 25-26
+    ]
+    for pat in patterns:
+        if re.match(pat, t):
+            return True
+    return False
+
 def clean_division_value(val: Any) -> str:
     text = normalize_text(val)
     if not text:
+        return ""
+
+    # Reject year-like values immediately
+    if is_year_like(text):
         return ""
 
     text = re.sub(
@@ -201,6 +220,8 @@ def clean_division_value(val: Any) -> str:
         "it": "Information Technology",
         "ict": "Information Technology",
         "ist": "Information Systems and Technology",
+        "nano": "Nanomaterials",
+        "mobility": "eMobility",
     }
 
     key = text.lower()
@@ -216,9 +237,28 @@ def looks_like_category(text: str) -> bool:
     }
     return normalize_text(text).lower() in categories
 
+def infer_division_from_filename(file_name: str) -> str:
+    """Extract division from filename keywords."""
+    name = file_name.lower()
+    if "hr" in name or "human" in name:
+        return "Human Resources"
+    if "ist" in name:
+        return "Information Systems and Technology"
+    if "it" in name or "information technology" in name:
+        return "Information Technology"
+    if "nano" in name:
+        return "Nanomaterials"
+    if "mobility" in name:
+        return "eMobility"
+    if "finance" in name:
+        return "Finance"
+    if "legal" in name:
+        return "Legal"
+    return ""
+
 def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: int = 12) -> Optional[str]:
     label_regex = re.compile(
-        r"^(division\/dept|division|department|dept|directorate|function|unit)\s*[:\-]?$",
+        r"^(division\/dept|division|department|dept|directorate|function|unit|business unit)\s*[:\-]?$",
         re.I
     )
 
@@ -240,7 +280,9 @@ def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: in
 
                 for cand in candidates:
                     cand_text = clean_division_value(cand)
-                    if not cand_text or len(cand_text) < 3:
+                    if not cand_text or len(cand_text) < 2:
+                        continue
+                    if is_year_like(cand_text):
                         continue
                     if looks_like_category(cand_text):
                         continue
@@ -254,8 +296,24 @@ def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: in
                     return cand_text
     return None
 
-def extract_division_from_sheet_context(file_name: str, sheet_name: str, header_preview: List[str]) -> str:
-    """Returns 'Unknown Division' if no explicit division found."""
+def get_division_for_risk(file_name: str, sheet_name: str, explicit_division: Optional[str]) -> str:
+    """Hierarchical division detection."""
+    # 1. Explicit division from cell
+    if explicit_division:
+        return explicit_division
+
+    # 2. Filename inference
+    inferred = infer_division_from_filename(file_name)
+    if inferred:
+        return inferred
+
+    # 3. Sheet name inference (cleaned)
+    clean_sheet = re.sub(r"(?i)\brisk\s*register\b", "", sheet_name).strip()
+    clean_sheet = re.sub(r"[_\-\s]+", " ", clean_sheet).strip()
+    if clean_sheet and not is_year_like(clean_sheet) and len(clean_sheet) >= 2:
+        return clean_sheet.title()
+
+    # 4. Fallback
     return "Unknown Division"
 
 # =============================================================================
@@ -623,13 +681,8 @@ def parse_structured_sheet(
     raw_rows: List[Dict[str, Any]] = []
     row_audit: List[Dict[str, Any]] = []
 
-    header_preview = [normalize_text(merged_cell_value(ws, header_row, c)) for c in range(1, min(ws.max_column, 20) + 1)]
-
     explicit_division = detect_explicit_division(ws, header_row=header_row)
-    if explicit_division:
-        division_name = explicit_division
-    else:
-        division_name = extract_division_from_sheet_context(file_name, sheet_name, header_preview)
+    division_name = get_division_for_risk(file_name, sheet_name, explicit_division)
 
     def get_field(row_idx: int, field_name: str) -> Any:
         col_idx = col_map.get(field_name)
@@ -787,7 +840,7 @@ def parse_structured_risk_register(
     default_residual: int
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     debug_info: Dict[str, Any] = {
-        "parser": "intelligent_structured_v5",
+        "parser": "intelligent_structured_v6",
         "candidate_sheets": [],
         "selected_sheets": [],
         "error": None,
@@ -884,8 +937,9 @@ def simple_fallback_parser(
                                 "risk no", "division/ dept",
                             ]
                             if not any(ind in text.lower() for ind in metadata_indicators):
+                                division_name = get_division_for_risk(file_name, sheet_name, None)
                                 row = {
-                                    "division": "Unknown Division",
+                                    "division": division_name,
                                     "risk_no": "",
                                     "objective_link": "",
                                     "risk_name": text[:80],
@@ -973,8 +1027,9 @@ Content:
             stmt = r.get("risk_statement", "")
             if not stmt or len(stmt) < 15:
                 continue
+            division_name = infer_division_from_filename(file_name) or "Unknown Division"
             row = {
-                "division": "Unknown Division",
+                "division": division_name,
                 "risk_name": r.get("risk_name", stmt[:50]),
                 "risk_statement": stmt[:500],
                 "category": "Uncategorised",
@@ -1633,6 +1688,8 @@ def create_division_chart(df: pd.DataFrame) -> go.Figure:
     if df.empty:
         return go.Figure()
     df_plot = df[df["primary_division"] != "Unknown Division"]
+    if df_plot.empty:
+        return go.Figure()
     div_exposure = df_plot.groupby("primary_division")["residual_score"].sum().sort_values(ascending=False).head(8)
     fig = go.Figure(data=[go.Bar(x=list(div_exposure.index), y=list(div_exposure.values), marker_color='#F97316')])
     fig.update_layout(title="Risk Exposure by Division", height=350, xaxis_tickangle=-30, plot_bgcolor="white", margin=dict(l=10, r=10, t=40, b=80))
