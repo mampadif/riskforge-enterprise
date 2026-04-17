@@ -22,7 +22,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.units import inch
 from rapidfuzz import fuzz, process
 
-# Optional sentence-transformers for semantic deduplication (falls back gracefully)
+# Optional sentence-transformers for semantic deduplication
 try:
     from sentence_transformers import SentenceTransformer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -35,7 +35,7 @@ except ImportError:
 # =============================================================================
 st.set_page_config(page_title="RiskForge Enterprise", page_icon="🛡️", layout="wide")
 
-# Stripe & secrets (only for payment; unlock codes work without Stripe)
+# Stripe & secrets
 STRIPE_SECRET_KEY = st.secrets.get("STRIPE_SECRET_KEY")
 STRIPE_PRICE_ID_PRO_MONTHLY = st.secrets.get("FORGE_STRIPE_PRICE_ID_PRO_MONTHLY")
 STRIPE_PRICE_ID_PRO_ANNUAL = st.secrets.get("FORGE_STRIPE_PRICE_ID_PRO_ANNUAL")
@@ -301,7 +301,7 @@ def get_division_for_risk(file_name: str, sheet_name: str, explicit: Optional[Di
     return "Unknown Division", "fallback", 0.0
 
 # =============================================================================
-# VALID CATEGORIES AND NORMALIZATION
+# VALID CATEGORIES
 # =============================================================================
 VALID_CATEGORIES = {
     "strategic",
@@ -384,8 +384,6 @@ FIELD_PATTERNS: Dict[str, List[str]] = {
     "category": [r"risk\s*category", r"category", r"type\s*of\s*risk"],
     "impact_text": [r"impact", r"severity"],
     "likelihood_text": [r"likelihood", r"probability"],
-    "inherent_text": [r"inherent\s*risk", r"inherent"],
-    "residual_text": [r"residual\s*risk", r"residual"],
     "controls": [r"controls", r"control\s*measure", r"existing\s*controls", r"current\s*controls"],
     "control_effectiveness_text": [r"control\s*effectiveness", r"effectiveness"],
     "owner": [r"risk\s*owner", r"owner", r"accountable", r"action\s*owner"],
@@ -563,19 +561,16 @@ def parse_risk_score(val: Any) -> Optional[float]:
 
     impact_map = {"critical": 5, "major": 4, "moderate": 3, "significant": 2, "minor": 1}
     likelihood_map = {"almost certain": 5, "likely": 4, "moderate": 3, "unlikely": 2, "rare": 1}
-    inherent_map = {"low": 5, "medium": 10, "high": 16, "critical": 20}
 
     if s in impact_map:
         return float(impact_map[s])
     if s in likelihood_map:
         return float(likelihood_map[s])
-    if s in inherent_map:
-        return float(inherent_map[s])
 
     match = re.search(r"(\d+(?:\.\d+)?)", s)
     if match:
         num = float(match.group(1))
-        if 1 <= num <= 25:
+        if 1 <= num <= 5:
             return num
     return None
 
@@ -612,47 +607,28 @@ def parse_control_effectiveness(val: Any) -> Optional[float]:
             return (num - 1) / 4.0
     return None
 
-def infer_impact_likelihood_from_inherent(inherent: float) -> Tuple[float, float]:
-    """Back-project inherent score to a plausible impact/likelihood pair."""
-    if inherent <= 0:
-        return 1.0, 1.0
-    pairs = [
-        (5, 4), (4, 5), (5, 3), (3, 5), (4, 4),
-        (4, 3), (3, 4), (3, 3), (5, 2), (2, 5),
-        (4, 2), (2, 4), (3, 2), (2, 3), (2, 2),
-        (5, 1), (1, 5), (4, 1), (1, 4), (3, 1), (1, 3)
-    ]
-    best_pair = (3, 3)
-    best_diff = float('inf')
-    for i, l in pairs:
-        diff = abs(i * l - inherent)
-        if diff < best_diff:
-            best_diff = diff
-            best_pair = (i, l)
-    return float(best_pair[0]), float(best_pair[1])
-
 def compute_scores(
     raw_impact: Any,
     raw_likelihood: Any,
-    raw_inherent: Any,          # ignored – we compute our own
-    raw_control_effectiveness: Any,
-    default_residual: int
-) -> Tuple[int, int, float, float, float, str]:
+    raw_control_effectiveness: Any
+) -> Tuple[int, int, float, float, Optional[float], str]:
     impact_score = parse_risk_score(raw_impact)
     likelihood_score = parse_risk_score(raw_likelihood)
+
+    # Default to 3 if missing
+    if impact_score is None:
+        impact_score = 3.0
+    if likelihood_score is None:
+        likelihood_score = 3.0
 
     control_eff_factor = parse_control_effectiveness(raw_control_effectiveness)
     control_eff_text = normalize_text(raw_control_effectiveness) or "Not rated"
 
-    # If impact or likelihood missing, infer from default residual
-    if impact_score is None or likelihood_score is None:
-        impact_score, likelihood_score = infer_impact_likelihood_from_inherent(float(default_residual))
+    # INHERENT = IMPACT × LIKELIHOOD
+    inherent = round(impact_score * likelihood_score)
+    inherent = min(25, max(1, inherent))
 
-    # ALWAYS compute inherent as impact × likelihood
-    inherent = impact_score * likelihood_score
-    inherent = min(25, max(1, round(inherent)))
-
-    # Residual = Inherent × (1 − Control Effectiveness)
+    # RESIDUAL = INHERENT × (1 − CONTROL EFFECTIVENESS)
     if control_eff_factor is not None:
         residual = round(inherent * (1.0 - control_eff_factor))
     else:
@@ -694,7 +670,6 @@ def parse_structured_sheet(
         raw_category = get_field(row_idx, "category")
         raw_impact_text = get_field(row_idx, "impact_text")
         raw_likelihood_text = get_field(row_idx, "likelihood_text")
-        raw_inherent_text = get_field(row_idx, "inherent_text")
         raw_controls = get_field(row_idx, "controls")
         raw_control_eff = get_field(row_idx, "control_effectiveness_text")
         raw_owner = get_field(row_idx, "owner")
@@ -739,9 +714,7 @@ def parse_structured_sheet(
         residual, inherent, impact_score, likelihood_score, control_eff_factor, control_eff_text = compute_scores(
             raw_impact=raw_impact_text,
             raw_likelihood=raw_likelihood_text,
-            raw_inherent=raw_inherent_text,
-            raw_control_effectiveness=raw_control_eff,
-            default_residual=default_residual,
+            raw_control_effectiveness=raw_control_eff
         )
 
         parsed_due_date = parse_due_date(raw_due_date)
@@ -827,7 +800,7 @@ def parse_structured_risk_register(
     default_residual: int
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     debug_info: Dict[str, Any] = {
-        "parser": "intelligent_structured_v13",
+        "parser": "intelligent_structured_v14",
         "candidate_sheets": [],
         "selected_sheets": [],
         "error": None,
@@ -925,10 +898,9 @@ def simple_fallback_parser(
                             ]
                             if not any(ind in text.lower() for ind in metadata_indicators):
                                 division_name, division_source, division_conf = get_division_for_risk(file_name, sheet_name, None)
-                                # Default impact/likelihood = 3
                                 impact = 3.0
                                 likelihood = 3.0
-                                inherent = impact * likelihood
+                                inherent = round(impact * likelihood)
                                 row = {
                                     "division": division_name,
                                     "division_source": division_source,
@@ -940,7 +912,7 @@ def simple_fallback_parser(
                                     "cause": "",
                                     "category": "Uncategorised",
                                     "inherent_score": inherent,
-                                    "residual_score": inherent,  # no control info
+                                    "residual_score": inherent,
                                     "impact_score": impact,
                                     "likelihood_score": likelihood,
                                     "owner": "Not assigned",
@@ -998,7 +970,7 @@ def parse_uploaded_file_bytes(
     return pd.DataFrame(), debug
 
 # =============================================================================
-# ENTERPRISE REGISTER BUILDING (WITH SAFE COLUMN ACCESS)
+# ENTERPRISE REGISTER BUILDING
 # =============================================================================
 def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if raw_df.empty:
@@ -1113,17 +1085,14 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         primary_owner = cluster_owners[0] if cluster_owners else "Not assigned"
         all_divisions_str = ", ".join(sorted(unique_divs))
 
-        # Controls aggregation
         primary_controls = max([c for c in cluster_controls if c], key=len) if any(cluster_controls) else ""
         all_controls = " | ".join(sorted(set(c for c in cluster_controls if c)))
         avg_control_eff = round(sum(cluster_control_eff_factor) / len(cluster_control_eff_factor), 2) if cluster_control_eff_factor else None
         worst_control_eff = max(cluster_control_eff_factor) if cluster_control_eff_factor else None
         worst_control_text = cluster_control_eff_text[cluster_control_eff_factor.index(worst_control_eff)] if worst_control_eff in cluster_control_eff_factor else "Not rated"
 
-        # Mitigation strength
         mitigation_strength = round((max_inherent - max_residual) / max_inherent * 100, 1) if max_inherent > 0 else 0.0
 
-        # Treatment aggregation
         strategy_counts = pd.Series([s for s in cluster_strategies if s]).value_counts()
         primary_strategy = strategy_counts.index[0] if not strategy_counts.empty else "Treat"
         all_strategies = ", ".join(sorted(set(s for s in cluster_strategies if s)))
