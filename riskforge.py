@@ -10,6 +10,7 @@ import re
 import io
 import base64
 import hashlib
+import os
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from openpyxl import load_workbook
@@ -20,7 +21,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.units import inch
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 
 # Optional imports – if sentence_transformers fails due to missing torchvision, we disable it
 try:
@@ -129,11 +130,6 @@ def make_json_serializable(obj: Any) -> Any:
 def cached_parse_file(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
     return parse_uploaded_file_bytes(file_bytes, file_name, default_residual)
 
-@st.cache_data(ttl=3600)
-def cached_ai_summary(snapshot_json: str, company: str) -> str:
-    snapshot = json.loads(snapshot_json)
-    return ai_polish_narrative(snapshot, company)
-
 # =============================================================================
 # UNIVERSAL PARSER HELPERS
 # =============================================================================
@@ -148,9 +144,6 @@ def normalize_text(val: Any) -> str:
     text = str(val).replace("\xa0", " ").strip()
     text = re.sub(r"\s+", " ", text)
     return text
-
-def safe_is_blank(val: Any) -> bool:
-    return normalize_text(val) == ""
 
 def merged_cell_value(ws, row_idx: int, col_idx: int) -> Any:
     cell = ws.cell(row=row_idx, column=col_idx)
@@ -225,18 +218,8 @@ def clean_division_value(val: Any) -> str:
 
 def looks_like_category(text: str) -> bool:
     categories = {
-        "strategic",
-        "financial",
-        "operational",
-        "compliance/legal",
-        "people/hr",
-        "ict/cyber",
-        "reputational",
-        "health/safety",
-        "environmental",
-        "legal",
-        "hr",
-        "uncategorised",
+        "strategic", "financial", "operational", "compliance/legal", "people/hr",
+        "ict/cyber", "reputational", "health/safety", "environmental", "legal", "hr", "uncategorised",
     }
     return normalize_text(text).lower() in categories
 
@@ -257,50 +240,47 @@ def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: in
 
             if label_regex.match(label):
                 candidates = []
-
                 for offset in range(1, 6):
                     candidates.append(merged_cell_value(ws, r, c + offset))
-
                 for offset in range(0, 6):
                     candidates.append(merged_cell_value(ws, r + 1, c + offset))
 
                 for cand in candidates:
                     cand_text = clean_division_value(cand)
-                    if not cand_text:
-                        continue
-                    if len(cand_text) < 3:
+                    if not cand_text or len(cand_text) < 3:
                         continue
                     if looks_like_category(cand_text):
                         continue
-
                     reject_terms = [
-                        "risk register",
-                        "risk description",
-                        "risk definition",
-                        "risk category",
-                        "impact",
-                        "likelihood",
-                        "inherent risk",
-                        "controls",
-                        "owner",
-                        "cause",
-                        "objective",
-                        "updated",
+                        "risk register", "risk description", "risk definition", "risk category",
+                        "impact", "likelihood", "inherent risk", "controls", "owner", "cause",
+                        "objective", "updated",
                     ]
                     if any(term in cand_text.lower() for term in reject_terms):
                         continue
-
                     return cand_text
-
     return None
+
+def is_valid_division_name(name: str) -> bool:
+    if len(name) < 3:
+        return False
+    if re.match(r"^\d{4}[-/]\d{2}$", name):
+        return False
+    if re.match(r"^\d+$", name):
+        return False
+    return True
 
 def extract_division_from_sheet_context(file_name: str, sheet_name: str, header_preview: List[str]) -> str:
     name = sheet_name if sheet_name else file_name
     name = re.sub(r"(?i)\brisk\s*register\b", "", name)
     name = re.sub(r"(?i)\bconsolidated\b", "", name)
     name = re.sub(r"[_\-\s]+", " ", name).strip()
-    if name:
+    if name and is_valid_division_name(name):
         return name.title()
+    base = os.path.splitext(file_name)[0]
+    base = re.sub(r"[_\-\s]+", " ", base).strip()
+    if is_valid_division_name(base):
+        return base.title()
     return clean_division_name(file_name)
 
 def parse_risk_score(val: Any) -> Optional[float]:
@@ -316,15 +296,9 @@ def parse_risk_score(val: Any) -> Optional[float]:
     if s in {"#n/a", "#value!", "#ref!", "#name?", "#num!", "#null!", "none", "nan", ""}:
         return None
 
-    impact_map = {
-        "critical": 5, "major": 4, "moderate": 3, "significant": 2, "minor": 1,
-    }
-    likelihood_map = {
-        "almost certain": 5, "likely": 4, "moderate": 3, "unlikely": 2, "rare": 1,
-    }
-    inherent_map = {
-        "low": 5, "medium": 10, "high": 16, "critical": 20,
-    }
+    impact_map = {"critical": 5, "major": 4, "moderate": 3, "significant": 2, "minor": 1}
+    likelihood_map = {"almost certain": 5, "likely": 4, "moderate": 3, "unlikely": 2, "rare": 1}
+    inherent_map = {"low": 5, "medium": 10, "high": 16, "critical": 20}
 
     if s in impact_map:
         return float(impact_map[s])
@@ -366,12 +340,8 @@ def parse_control_effectiveness(val: Any) -> Optional[int]:
     return None
 
 def infer_category_from_text(title: str, statement: str, cause: str, raw_category: str = "") -> str:
-    combined = " ".join([
-        normalize_text(raw_category),
-        normalize_text(title),
-        normalize_text(statement),
-        normalize_text(cause),
-    ]).lower()
+    combined = " ".join([normalize_text(raw_category), normalize_text(title),
+                         normalize_text(statement), normalize_text(cause)]).lower()
 
     if raw_category:
         raw = normalize_text(raw_category)
@@ -402,22 +372,8 @@ def infer_category_from_text(title: str, statement: str, cause: str, raw_categor
 FIELD_PATTERNS: Dict[str, List[str]] = {
     "risk_no": [r"risk\s*no", r"risk\s*id", r"identifier"],
     "objective": [r"link\s*to\s*objective", r"objective"],
-    "risk_name": [
-        r"risk\s*description",
-        r"risk\s*title",
-        r"risk\s*name",
-        r"name\s*of\s*risk",
-        r"^risk$",
-        r"key\s*risk",
-    ],
-    "risk_statement": [
-        r"risk\s*definition",
-        r"statement",
-        r"risk\s*event",
-        r"risk\s*detail",
-        r"risk\s*narrative",
-        r"description\s*of\s*risk",
-    ],
+    "risk_name": [r"risk\s*description", r"risk\s*title", r"risk\s*name", r"name\s*of\s*risk", r"^risk$", r"key\s*risk"],
+    "risk_statement": [r"risk\s*definition", r"statement", r"risk\s*event", r"risk\s*detail", r"risk\s*narrative", r"description\s*of\s*risk"],
     "cause": [r"cause", r"root\s*cause"],
     "category": [r"risk\s*category", r"category", r"type\s*of\s*risk"],
     "impact_text": [r"impact", r"severity"],
@@ -504,37 +460,69 @@ def rank_candidate_sheets(wb) -> List[Dict[str, Any]]:
     return candidates
 
 # =============================================================================
-# ROW PARSING
+# ROW ACCEPTANCE SCORING (INTELLIGENCE LAYER)
 # =============================================================================
-def should_skip_row(
-    row_idx: int,
-    risk_no: str,
-    risk_name: str,
-    risk_statement: str,
-    cause: str,
-    controls: str
-) -> Tuple[bool, str]:
-    combined_gate_text = " ".join([risk_no, risk_name, risk_statement, cause, controls]).strip()
-    if not combined_gate_text:
-        return True, "blank_row"
+def is_valid_risk_record(row: Dict[str, Any]) -> Tuple[bool, int, str]:
+    """Returns (is_valid, confidence_score, reason)."""
+    evidence = 0
+    reasons = []
 
-    lower_gate = combined_gate_text.lower()
+    if row.get("risk_name") and len(row["risk_name"]) > 3:
+        evidence += 2
+        reasons.append("has_risk_name")
+    else:
+        reasons.append("missing_risk_name")
 
-    metadata_indicators = [
-        "risk description", "risk definition", "link to objective", "control effectiveness",
-        "treatment due date", "risk strategy", "risk owner", "impact (1-5)", "likelihood score",
-        "inherent risk", "residual risk", "division/dept", "what is in place to prevent",
-    ]
-    if any(ind in lower_gate for ind in metadata_indicators):
-        return True, "metadata_row"
+    if row.get("risk_statement") and len(row["risk_statement"]) > 20:
+        evidence += 2
+        reasons.append("has_risk_statement")
+    else:
+        reasons.append("missing_or_short_statement")
 
-    if risk_name.startswith("=") or risk_statement.startswith("="):
-        return True, "formula_row"
+    if row.get("cause"):
+        evidence += 1
+        reasons.append("has_cause")
+    if row.get("controls"):
+        evidence += 1
+        reasons.append("has_controls")
+    if row.get("owner") and row["owner"].lower() != "not assigned":
+        evidence += 1
+        reasons.append("has_owner")
+    if row.get("category"):
+        evidence += 1
+        reasons.append("has_category")
+    if row.get("impact_score") is not None:
+        evidence += 1
+        reasons.append("has_impact")
+    if row.get("likelihood_score") is not None:
+        evidence += 1
+        reasons.append("has_likelihood")
+    if row.get("treatment_plan"):
+        evidence += 1
+        reasons.append("has_treatment")
 
-    if not risk_name and not risk_statement:
-        return True, "missing_title_and_statement"
+    is_valid = evidence >= 5
+    reason_str = " | ".join(reasons)
+    return is_valid, evidence, reason_str
 
-    return False, "accepted"
+def merge_continuation_rows(rows: List[Dict]) -> List[Dict]:
+    """Merge rows that are continuations (no risk_name/statement) into previous risk."""
+    merged = []
+    current = None
+    for row in rows:
+        if row.get("risk_name") or row.get("risk_statement"):
+            if current:
+                merged.append(current)
+            current = row.copy()
+        else:
+            if current:
+                current["risk_statement"] += " " + (row.get("risk_statement") or "")
+                current["cause"] += " " + (row.get("cause") or "")
+                current["controls"] += " " + (row.get("controls") or "")
+                current["treatment_plan"] += " " + (row.get("treatment_plan") or "")
+    if current:
+        merged.append(current)
+    return merged
 
 def compute_scores(
     raw_impact: Any,
@@ -586,7 +574,7 @@ def parse_structured_sheet(
     file_name: str,
     default_residual: int
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    risks: List[Dict[str, Any]] = []
+    raw_rows: List[Dict[str, Any]] = []
     row_audit: List[Dict[str, Any]] = []
 
     header_preview = [normalize_text(merged_cell_value(ws, header_row, c)) for c in range(1, min(ws.max_column, 20) + 1)]
@@ -638,48 +626,29 @@ def parse_structured_sheet(
         status = normalize_text(raw_status) or "Active"
         due_date_raw = normalize_text(raw_due_date)
 
-        # Fallbacks
-        if not risk_statement and risk_name:
-            risk_statement = risk_name
-        if not risk_name and risk_statement:
-            risk_name = risk_statement[:80]
-
-        skip, reason = should_skip_row(
-            row_idx=row_idx,
-            risk_no=risk_no,
-            risk_name=risk_name,
-            risk_statement=risk_statement,
-            cause=cause,
-            controls=controls,
-        )
-
-        if reason == "blank_row":
+        # Skip empty rows
+        combined_gate = " ".join([risk_no, risk_name, risk_statement, cause, controls]).strip()
+        if not combined_gate:
             blank_streak += 1
-            row_audit.append({
-                "row": row_idx,
-                "risk_no": risk_no,
-                "risk_name": risk_name,
-                "risk_statement": risk_statement,
-                "status": "skipped",
-                "reason": reason,
-            })
             if blank_streak >= 12:
                 break
             continue
-
         blank_streak = 0
 
-        if skip:
-            row_audit.append({
-                "row": row_idx,
-                "risk_no": risk_no,
-                "risk_name": risk_name,
-                "risk_statement": risk_statement,
-                "status": "skipped",
-                "reason": reason,
-            })
+        # Skip obvious metadata/headers
+        lower_gate = combined_gate.lower()
+        metadata_indicators = [
+            "risk description", "risk definition", "link to objective", "control effectiveness",
+            "treatment due date", "risk strategy", "risk owner", "impact (1-5)", "likelihood score",
+            "inherent risk", "residual risk", "division/dept", "what is in place to prevent",
+        ]
+        if any(ind in lower_gate for ind in metadata_indicators):
             continue
 
+        if risk_name.startswith("=") or risk_statement.startswith("="):
+            continue
+
+        # Compute scores
         residual, inherent, impact_score, likelihood_score, control_eff_numeric, control_eff_text = compute_scores(
             raw_impact=raw_impact_text,
             raw_likelihood=raw_likelihood_text,
@@ -697,11 +666,8 @@ def parse_structured_sheet(
             raw_category=category_raw,
         )
 
-        risks.append({
+        raw_rows.append({
             "division": division_name,
-            "division_confidence": 0.95,
-            "division_source": f"structured_sheet:{sheet_name}",
-            "source_sheet": sheet_name,
             "risk_no": risk_no,
             "objective_link": objective,
             "risk_name": risk_name,
@@ -721,28 +687,50 @@ def parse_structured_sheet(
             "controls": controls,
             "strategy": strategy or "Treat",
             "treatment_plan": treatment,
+            "source_file": file_name,
+            "source_sheet": sheet_name,
+            "source_row": row_idx,
         })
 
-        row_audit.append({
-            "row": row_idx,
-            "risk_no": risk_no,
-            "risk_name": risk_name,
-            "risk_statement": risk_statement,
-            "status": "accepted",
-            "reason": "parsed_successfully",
-        })
+    # Merge continuation rows
+    raw_rows = merge_continuation_rows(raw_rows)
+
+    # Validate and score each row
+    accepted_risks = []
+    for row in raw_rows:
+        is_valid, confidence, reason = is_valid_risk_record(row)
+        if is_valid:
+            row["acceptance_score"] = confidence
+            row["acceptance_reason"] = reason
+            row["parser_confidence"] = 0.95
+            accepted_risks.append(row)
+            row_audit.append({
+                "row": row["source_row"],
+                "risk_name": row["risk_name"],
+                "status": "accepted",
+                "confidence": confidence,
+                "reason": reason,
+            })
+        else:
+            row_audit.append({
+                "row": row["source_row"],
+                "risk_name": row["risk_name"],
+                "status": "rejected",
+                "confidence": confidence,
+                "reason": reason,
+            })
 
     debug = {
         "sheet_used": sheet_name,
         "header_row": header_row,
         "column_map": col_map,
-        "rows_checked": len(row_audit),
-        "risks_found": len(risks),
+        "rows_scanned": len(raw_rows) + len(row_audit) - len(accepted_risks),  # approximate
+        "rows_accepted": len(accepted_risks),
+        "acceptance_rate": round(len(accepted_risks) / max(1, len(raw_rows)) * 100, 1),
         "row_audit_preview": row_audit[:100],
-        "skipped_rows": [r for r in row_audit if r["status"] == "skipped"][:60],
     }
 
-    return pd.DataFrame(risks), debug
+    return pd.DataFrame(accepted_risks), debug
 
 # =============================================================================
 # UNIVERSAL PARSER ENTRY POINT
@@ -753,7 +741,7 @@ def parse_structured_risk_register(
     default_residual: int
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     debug_info: Dict[str, Any] = {
-        "parser": "universal_structured_register_v2",
+        "parser": "intelligent_structured_v3",
         "candidate_sheets": [],
         "selected_sheets": [],
         "error": None,
@@ -777,32 +765,25 @@ def parse_structured_risk_register(
             debug_info["error"] = "No structured risk register sheet detected"
             return pd.DataFrame(), debug_info
 
-        all_dfs = []
-        for idx, candidate in enumerate(strong_candidates[:3]):
-            sheet_name = candidate["sheet_name"]
-            debug_info["selected_sheets"].append(sheet_name)
+        # Parse only the best sheet (avoid over-extraction)
+        best = strong_candidates[0]
+        debug_info["selected_sheets"] = [best["sheet_name"]]
 
-            ws = wb[sheet_name]
-            df_sheet, parse_debug = parse_structured_sheet(
-                ws=ws,
-                sheet_name=sheet_name,
-                col_map=candidate["column_map"],
-                header_row=candidate["header_row"],
-                file_name=file_name,
-                default_residual=default_residual,
-            )
-            if not df_sheet.empty:
-                all_dfs.append(df_sheet)
-            if idx == 0:
-                debug_info.update(parse_debug)
+        ws = wb[best["sheet_name"]]
+        df_sheet, parse_debug = parse_structured_sheet(
+            ws=ws,
+            sheet_name=best["sheet_name"],
+            col_map=best["column_map"],
+            header_row=best["header_row"],
+            file_name=file_name,
+            default_residual=default_residual,
+        )
+        debug_info.update(parse_debug)
 
-        if all_dfs:
-            combined_df = pd.concat(all_dfs, ignore_index=True)
-            combined_df = combined_df.drop_duplicates(subset=["risk_statement", "risk_name"], keep="first")
-            debug_info["total_risks_found"] = len(combined_df)
-            return combined_df, debug_info
+        if not df_sheet.empty:
+            return df_sheet, debug_info
 
-        debug_info["error"] = "Structured sheets detected but no risks parsed"
+        debug_info["error"] = "No valid risks parsed after acceptance scoring"
         return pd.DataFrame(), debug_info
 
     except Exception as exc:
@@ -847,11 +828,8 @@ def simple_fallback_parser(
                                 "risk no", "division/ dept",
                             ]
                             if not any(ind in text.lower() for ind in metadata_indicators):
-                                risks.append({
+                                row = {
                                     "division": clean_division_name(file_name),
-                                    "division_confidence": 0.60,
-                                    "division_source": f"simple_fallback:{sheet_name}",
-                                    "source_sheet": sheet_name,
                                     "risk_no": "",
                                     "objective_link": "",
                                     "risk_name": text[:80],
@@ -871,10 +849,19 @@ def simple_fallback_parser(
                                     "controls": "",
                                     "strategy": "Treat",
                                     "treatment_plan": "",
-                                })
-                                debug_info["risks_found"] += 1
-                                if len(risks) >= 20:
-                                    break
+                                    "source_file": file_name,
+                                    "source_sheet": sheet_name,
+                                    "source_row": row_idx,
+                                }
+                                is_valid, conf, reason = is_valid_risk_record(row)
+                                if is_valid:
+                                    row["acceptance_score"] = conf
+                                    row["acceptance_reason"] = reason
+                                    row["parser_confidence"] = 0.60
+                                    risks.append(row)
+                                    debug_info["risks_found"] += 1
+                                    if len(risks) >= 20:
+                                        break
                 if len(risks) >= 20:
                     break
             if len(risks) >= 20:
@@ -930,10 +917,8 @@ Content:
             stmt = r.get("risk_statement", "")
             if not stmt or len(stmt) < 15:
                 continue
-            rows.append({
+            row = {
                 "division": clean_division_name(file_name),
-                "division_confidence": 0.8,
-                "division_source": "gemini",
                 "risk_name": r.get("risk_name", stmt[:50]),
                 "risk_statement": stmt[:500],
                 "category": "Uncategorised",
@@ -945,7 +930,14 @@ Content:
                 "control_effectiveness": "Not rated",
                 "impact_score": r.get("impact_score"),
                 "likelihood_score": r.get("likelihood_score"),
-            })
+                "source_file": file_name,
+                "source_sheet": "gemini",
+                "source_row": 0,
+                "acceptance_score": 5,
+                "acceptance_reason": "gemini_extracted",
+                "parser_confidence": 0.80,
+            }
+            rows.append(row)
         if rows:
             return pd.DataFrame(rows), {"extracted": len(rows), "method": "gemini"}
         return pd.DataFrame(), {"error": "No risks found"}
@@ -960,10 +952,10 @@ def parse_uploaded_file_bytes(
     file_name: str,
     default_residual: int
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    # 1. Universal structured parser
+    # 1. Intelligent structured parser
     df, debug = parse_structured_risk_register(file_bytes, file_name, default_residual)
     if not df.empty:
-        st.success(f"✅ Extracted {len(df)} risks")
+        st.success(f"✅ Extracted {len(df)} risks (acceptance rate {debug.get('acceptance_rate', 0)}%)")
         return df, debug
 
     # 2. Simple fallback
@@ -982,103 +974,102 @@ def parse_uploaded_file_bytes(
 
     return pd.DataFrame(), debug
 
+# =============================================================================
+# ENTERPRISE CLUSTER CONSOLIDATION
+# =============================================================================
+def build_enterprise_clusters(df: pd.DataFrame) -> pd.DataFrame:
+    """Group similar risks into enterprise clusters."""
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df["cluster_id"] = None
+    df["cluster_label"] = None
+    df["cluster_primary_statement"] = None
+
+    statements = df["risk_statement"].fillna("").tolist()
+    names = df["risk_name"].fillna("").tolist()
+
+    clusters = []
+    used = set()
+
+    for i, stmt in enumerate(statements):
+        if i in used:
+            continue
+        # Find similar statements
+        matches = process.extract(stmt, statements, scorer=fuzz.token_sort_ratio, limit=10)
+        cluster_indices = [i]
+        for match in matches:
+            if match[1] >= 75 and match[2] not in used:
+                cluster_indices.append(match[2])
+                used.add(match[2])
+        used.update(cluster_indices)
+        clusters.append(cluster_indices)
+
+    for cluster_id, indices in enumerate(clusters):
+        cluster_label = names[indices[0]]
+        primary_stmt = statements[indices[0]]
+        for idx in indices:
+            df.at[idx, "cluster_id"] = cluster_id
+            df.at[idx, "cluster_label"] = cluster_label
+            df.at[idx, "cluster_primary_statement"] = primary_stmt
+
+    return df
+
 def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[pd.DataFrame, List[Dict]]:
     all_risks = []
     all_debug = []
+    total_scanned = 0
+    total_accepted = 0
+
     for file in uploaded_files:
         df, debug = cached_parse_file(file.getvalue(), file.name, default_residual)
         all_debug.append(debug)
+        total_scanned += debug.get("rows_scanned", 0)
+        total_accepted += len(df)
         if not df.empty:
             all_risks.append(df)
+
     if not all_risks:
         return pd.DataFrame(), all_debug
+
     df_all = pd.concat(all_risks, ignore_index=True)
-    df_all, _ = detect_semantic_duplicates(df_all, threshold=0.85)
-    df_all["residual_level"] = df_all["residual_score"].apply(lambda x: "Critical" if x >= 20 else "High" if x >= 12 else "Medium" if x >= 6 else "Low")
+
+    # Apply enterprise clustering
+    df_all = build_enterprise_clusters(df_all)
+
+    # Deduplicate exact matches
+    before_dedupe = len(df_all)
+    df_all["_stmt_norm"] = df_all["risk_statement"].fillna("").apply(lambda x: re.sub(r"[^\w\s]", "", x.lower()).strip())
+    df_all = df_all.drop_duplicates(subset=["_stmt_norm"], keep="first")
+    df_all = df_all.drop(columns=["_stmt_norm"])
+
+    df_all["residual_level"] = df_all["residual_score"].apply(
+        lambda x: "Critical" if x >= 20 else "High" if x >= 12 else "Medium" if x >= 6 else "Low"
+    )
+
     if tier == "free":
         df_all = df_all.head(10)
-    st.session_state.parser_audit = {"total_files": len(uploaded_files), "total_risks": len(df_all)}
+
+    st.session_state.parser_audit = {
+        "total_files": len(uploaded_files),
+        "total_risks": len(df_all),
+        "rows_scanned": total_scanned,
+        "rows_accepted": total_accepted,
+        "acceptance_rate": round(total_accepted / max(1, total_scanned) * 100, 1),
+        "duplicates_removed": before_dedupe - len(df_all),
+        "clusters_formed": df_all["cluster_id"].nunique() if "cluster_id" in df_all.columns else 0,
+    }
+
     return df_all, all_debug
 
 # =============================================================================
-# SEMANTIC DUPLICATE DETECTION
+# AI FUNCTIONS
 # =============================================================================
-def normalize_for_dedupe(text: str) -> str:
-    if not isinstance(text, str):
-        return ""
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-def embedding_similarity(texts: List[str]) -> Optional[np.ndarray]:
-    if not EMBEDDING_AVAILABLE or len(texts) < 2:
-        return None
-    model = get_embedding_model()
-    if model is None:
-        return None
-    try:
-        embeddings = model.encode(texts)
-        return cosine_similarity(embeddings)
-    except:
-        return None
-
-def detect_semantic_duplicates(df: pd.DataFrame, threshold: float = 0.85) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if df.empty:
-        return df, pd.DataFrame()
-    df = df.copy()
-    df["_normalized"] = df["risk_statement"].fillna("").apply(normalize_for_dedupe)
-    df["_hash"] = df["_normalized"].apply(lambda x: hashlib.md5(x.encode()).hexdigest())
-    df = df.drop_duplicates(subset=["_hash"], keep="first")
-    keep_indices = []
-    duplicate_map = []
-    statements = df["_normalized"].tolist()
-    sim_matrix = embedding_similarity(statements) if EMBEDDING_AVAILABLE and len(statements) > 1 else None
-    for i, stmt in enumerate(statements):
-        is_duplicate = False
-        for j in keep_indices:
-            if j >= len(statements):
-                continue
-            if sim_matrix is not None and i < sim_matrix.shape[0] and j < sim_matrix.shape[1]:
-                similarity = sim_matrix[i][j]
-            else:
-                similarity = fuzz.ratio(stmt, statements[j]) / 100.0
-            if similarity >= threshold:
-                duplicate_map.append({"kept_index": j, "dropped_index": i, "similarity": similarity})
-                is_duplicate = True
-                break
-        if not is_duplicate:
-            keep_indices.append(i)
-    deduped = df.iloc[keep_indices].reset_index(drop=True)
-    duplicates_df = pd.DataFrame(duplicate_map) if duplicate_map else pd.DataFrame()
-    deduped = deduped.drop(columns=["_normalized", "_hash"])
-    return deduped, duplicates_df
-
-# =============================================================================
-# AI FUNCTIONS (ENHANCED)
-# =============================================================================
-def ai_infer_category(statement: str, fallback: str = "Uncategorised") -> str:
-    categories = ["Strategic", "Financial", "Operational", "ICT/Cyber", "Compliance/Legal", "People/HR", "Health/Safety", "Reputational", "Environmental"]
-    if not GEMINI_AVAILABLE or len(statement) < 20:
-        return fallback
-    try:
-        prompt = f"Classify this risk into exactly one of these categories: {', '.join(categories)}. Return ONLY the category name.\nRisk: {statement[:400]}"
-        response = ai_model.generate_content(prompt)
-        result = response.text.strip()
-        if result in categories:
-            return result
-    except:
-        pass
-    return fallback
-
-def ai_polish_narrative(snapshot: Dict, company: str) -> str:
-    # Legacy function, kept for compatibility
-    return ai_executive_briefing(snapshot, [], {}, company)
-
 def ai_executive_briefing(snapshot: Dict, correlations: List[Dict], recommendations: Dict, company: str) -> str:
     if not GEMINI_AVAILABLE:
         return ""
-    
+
     context = f"""
     Company: {company}
     Health Score: {snapshot.get('enterprise_health_score', 0)}/100
@@ -1087,18 +1078,18 @@ def ai_executive_briefing(snapshot: Dict, correlations: List[Dict], recommendati
     Top Division: {snapshot.get('top_division', 'N/A')} ({snapshot.get('top_division_pct', 0)}% of exposure)
     Appetite Breached: {snapshot.get('pct_breached', 0)}%
     Treatment Confidence: {snapshot.get('treatment_confidence', 0)}%
-    
+
     Cross-Division Correlations Found: {len(correlations)}
     """
-    
+
     if correlations:
         context += "\nTop Correlated Risks Across Divisions:\n"
         for corr in correlations[:3]:
             context += f"- {corr['risk_a']['name']} ({corr['risk_a']['division']}) ↔ {corr['risk_b']['name']} ({corr['risk_b']['division']}) - {corr['similarity']}% similar\n"
-    
+
     if recommendations:
         context += f"\nThreshold Recommendation: {recommendations.get('global', {}).get('recommended', 'N/A')} (current: {snapshot.get('threshold', 12)})\n"
-    
+
     prompt = f"""
     You are a Chief Risk Officer writing a board‑level executive briefing.
     Based on the data below, write a concise but insightful 4‑5 sentence briefing that:
@@ -1106,13 +1097,13 @@ def ai_executive_briefing(snapshot: Dict, correlations: List[Dict], recommendati
     - Identifies cross‑divisional risk patterns and what they mean.
     - Suggests 1‑2 actionable focus areas for the next quarter.
     - Uses professional, confident language suitable for the board.
-    
+
     Data:
     {context}
-    
+
     Briefing:
     """
-    
+
     try:
         response = ai_model.generate_content(prompt)
         return response.text.strip()
@@ -1120,7 +1111,7 @@ def ai_executive_briefing(snapshot: Dict, correlations: List[Dict], recommendati
         return ""
 
 # =============================================================================
-# INTELLIGENCE ENGINE (ENHANCED)
+# INTELLIGENCE ENGINE
 # =============================================================================
 def calculate_weighted_treatment_confidence(row: pd.Series) -> float:
     score = 0.0
@@ -1203,20 +1194,20 @@ def detect_emerging_themes(df: pd.DataFrame) -> List[str]:
 def find_cross_division_correlations(df: pd.DataFrame, threshold: float = 0.75) -> List[Dict]:
     if df.empty or len(df["division"].unique()) < 2:
         return []
-    
+
     correlations = []
     statements = df["risk_statement"].fillna("").tolist()
     divisions = df["division"].tolist()
     risk_names = df["risk_name"].tolist()
-    
+
     for i in range(len(statements)):
         for j in range(i + 1, len(statements)):
             if divisions[i] == divisions[j]:
                 continue
-            
+
             text_i = f"{risk_names[i]} {statements[i]}"
             text_j = f"{risk_names[j]} {statements[j]}"
-            
+
             similarity = fuzz.ratio(text_i.lower(), text_j.lower()) / 100.0
             if similarity >= threshold:
                 correlations.append({
@@ -1224,23 +1215,23 @@ def find_cross_division_correlations(df: pd.DataFrame, threshold: float = 0.75) 
                     "risk_b": {"name": risk_names[j], "division": divisions[j], "statement": statements[j][:200]},
                     "similarity": round(similarity * 100, 1)
                 })
-    
+
     correlations.sort(key=lambda x: x["similarity"], reverse=True)
     return correlations[:10]
 
 def recommend_appetite_thresholds(df: pd.DataFrame, current_threshold: int) -> Dict[str, Any]:
     if df.empty:
         return {}
-    
+
     recommendations = {}
     overall_q75 = df["residual_score"].quantile(0.75)
-    
+
     recommendations["global"] = {
         "current": current_threshold,
         "recommended": int(min(25, max(6, round(overall_q75)))),
         "reason": f"75th percentile of residual scores is {overall_q75:.1f}"
     }
-    
+
     for category in df["category"].unique():
         cat_df = df[df["category"] == category]
         if len(cat_df) >= 3:
@@ -1249,21 +1240,21 @@ def recommend_appetite_thresholds(df: pd.DataFrame, current_threshold: int) -> D
                 "recommended": int(min(25, max(6, round(cat_q75)))),
                 "reason": f"75th percentile for {category} risks is {cat_q75:.1f}"
             }
-    
+
     return recommendations
 
 def analyze_trends(current: Dict, previous: Dict) -> Dict[str, Any]:
     if not previous:
         return {}
-    
+
     trends = {}
     health_delta = current.get("enterprise_health_score", 0) - previous.get("enterprise_health_score", 0)
     trends["health_trend"] = "improving" if health_delta > 0 else "declining" if health_delta < 0 else "stable"
     trends["health_delta"] = health_delta
-    
+
     breach_delta = current.get("pct_breached", 0) - previous.get("pct_breached", 0)
     trends["breach_trend"] = "worsening" if breach_delta > 0 else "improving" if breach_delta < 0 else "stable"
-    
+
     prev_cat = previous.get("category_exposure", {})
     curr_cat = current.get("category_exposure", {})
     growth = {}
@@ -1271,11 +1262,11 @@ def analyze_trends(current: Dict, previous: Dict) -> Dict[str, Any]:
         prev_exp = prev_cat.get(cat, 0)
         if prev_exp > 0:
             growth[cat] = (exp - prev_exp) / prev_exp * 100
-    
+
     if growth:
         fastest = max(growth, key=growth.get)
         trends["fastest_growing_category"] = {"category": fastest, "growth_pct": round(growth[fastest], 1)}
-    
+
     return trends
 
 def build_intelligence_snapshot(df: pd.DataFrame, threshold: int, category_appetite: Dict = None) -> Dict[str, Any]:
@@ -1381,7 +1372,7 @@ def generate_board_narrative(snapshot: Dict, comparison: Dict, threshold: int, c
     return "\n".join(narrative)
 
 # =============================================================================
-# EXCEL & PDF EXPORTS (INTELLIGENT)
+# EXCEL & PDF EXPORTS
 # =============================================================================
 def style_excel_with_risk_colors(wb):
     level_colors = {
@@ -1434,7 +1425,6 @@ def generate_intelligent_excel_pack(data: Dict[str, Any], narrative: str, correl
         if st.session_state.parser_audit:
             audit_df = pd.DataFrame([st.session_state.parser_audit])
             audit_df.to_excel(writer, sheet_name="Parser Audit", index=False)
-        # New intelligence sheets
         if correlations:
             corr_df = pd.DataFrame([{
                 "Risk A Name": c["risk_a"]["name"],
@@ -1449,7 +1439,7 @@ def generate_intelligent_excel_pack(data: Dict[str, Any], narrative: str, correl
             trends_df.to_excel(writer, sheet_name="Trend Analysis", index=False)
         briefing_df = pd.DataFrame({"Executive Briefing": [data.get("ai_summary", "")]})
         briefing_df.to_excel(writer, sheet_name="AI Executive Briefing", index=False)
-    
+
     output.seek(0)
     wb = load_workbook(output)
     style_excel_with_risk_colors(wb)
@@ -1520,7 +1510,9 @@ def generate_pdf_board_pack(narrative: str, snapshot: Dict, company: str, report
 def create_category_chart(df: pd.DataFrame) -> go.Figure:
     if df.empty:
         return go.Figure()
-    cat_exposure = df.groupby("category")["residual_score"].sum().sort_values(ascending=False).head(8)
+    df_plot = df.copy()
+    df_plot["category_clean"] = df_plot["category"].apply(lambda x: x.split("/")[0].strip() if isinstance(x, str) else x)
+    cat_exposure = df_plot.groupby("category_clean")["residual_score"].sum().sort_values(ascending=False).head(8)
     fig = go.Figure(data=[go.Bar(x=list(cat_exposure.values), y=list(cat_exposure.index), orientation='h', marker_color='#4A90E2')])
     fig.update_layout(title="Risk Exposure by Category", height=350, plot_bgcolor="white", margin=dict(l=10, r=10, t=40, b=10))
     return fig
@@ -1528,7 +1520,10 @@ def create_category_chart(df: pd.DataFrame) -> go.Figure:
 def create_division_chart(df: pd.DataFrame) -> go.Figure:
     if df.empty:
         return go.Figure()
-    div_exposure = df.groupby("division")["residual_score"].sum().sort_values(ascending=False).head(8)
+    df_plot = df.copy()
+    df_plot = df_plot[~df_plot["division"].str.match(r"^\d{4}[-/]\d{2}$", na=False)]
+    df_plot = df_plot[df_plot["division"] != "Unknown Division"]
+    div_exposure = df_plot.groupby("division")["residual_score"].sum().sort_values(ascending=False).head(8)
     fig = go.Figure(data=[go.Bar(x=list(div_exposure.index), y=list(div_exposure.values), marker_color='#F97316')])
     fig.update_layout(title="Risk Exposure by Division", height=350, xaxis_tickangle=-30, plot_bgcolor="white", margin=dict(l=10, r=10, t=40, b=80))
     return fig
@@ -1562,166 +1557,81 @@ def create_treatment_gauge(confidence: float) -> go.Figure:
 def apply_custom_theme(primary: str, secondary: str) -> None:
     st.markdown(f"""
     <style>
-    body, .stApp {{
-        background-color: #f9fafb;
-    }}
-    .stTabs [data-baseweb="tab-list"] {{
-        gap: 8px;
-        background-color: transparent;
-    }}
+    body, .stApp {{ background-color: #f9fafb; }}
+    .stTabs [data-baseweb="tab-list"] {{ gap: 8px; background-color: transparent; }}
     .stTabs [data-baseweb="tab"] {{
-        border-radius: 12px 12px 0 0;
-        padding: 12px 24px;
-        background-color: white;
-        border: 1px solid #e2e8f0;
-        border-bottom: none;
-        font-weight: 600;
-        color: #475569;
+        border-radius: 12px 12px 0 0; padding: 12px 24px; background-color: white;
+        border: 1px solid #e2e8f0; border-bottom: none; font-weight: 600; color: #475569;
     }}
     .stTabs [aria-selected="true"] {{
-        background-color: {primary} !important;
-        color: white !important;
-        border-color: {primary} !important;
+        background-color: {primary} !important; color: white !important; border-color: {primary} !important;
     }}
     .stButton > button {{
         background: linear-gradient(145deg, {primary} 0%, {secondary} 100%);
-        color: white;
-        border: none;
-        border-radius: 40px;
-        padding: 12px 28px;
-        font-weight: 600;
-        transition: all 0.2s;
-        box-shadow: 0 4px 12px rgba(14, 54, 92, 0.2);
-        border: none;
+        color: white; border: none; border-radius: 40px; padding: 12px 28px; font-weight: 600;
+        transition: all 0.2s; box-shadow: 0 4px 12px rgba(14, 54, 92, 0.2);
     }}
-    .stButton > button:hover {{
-        transform: translateY(-2px);
-        box-shadow: 0 8px 20px rgba(14, 54, 92, 0.3);
-    }}
+    .stButton > button:hover {{ transform: translateY(-2px); box-shadow: 0 8px 20px rgba(14, 54, 92, 0.3); }}
     .exec-card {{
-        background: #ffffff;
-        border-radius: 20px;
-        padding: 22px 24px;
-        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
-        border: 1px solid rgba(14, 54, 92, 0.08);
-        margin-bottom: 20px;
+        background: #ffffff; border-radius: 20px; padding: 22px 24px;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04); border: 1px solid rgba(14, 54, 92, 0.08); margin-bottom: 20px;
     }}
     .exec-card-header {{
-        display: flex;
-        align-items: center;
-        margin-bottom: 18px;
-        border-bottom: 1px solid #eef2f6;
-        padding-bottom: 14px;
+        display: flex; align-items: center; margin-bottom: 18px; border-bottom: 1px solid #eef2f6; padding-bottom: 14px;
     }}
-    .exec-card-title {{
-        font-size: 1.2rem;
-        font-weight: 700;
-        color: {primary};
-        letter-spacing: -0.01em;
-    }}
+    .exec-card-title {{ font-size: 1.2rem; font-weight: 700; color: {primary}; letter-spacing: -0.01em; }}
     .exec-badge {{
-        display: inline-block;
-        padding: 6px 14px;
-        border-radius: 40px;
-        font-size: 0.8rem;
-        font-weight: 700;
-        letter-spacing: 0.2px;
-        text-transform: uppercase;
+        display: inline-block; padding: 6px 14px; border-radius: 40px; font-size: 0.8rem;
+        font-weight: 700; letter-spacing: 0.2px; text-transform: uppercase;
     }}
-    .exec-metric-row {{
-        display: flex;
-        justify-content: space-between;
-        margin-bottom: 14px;
-    }}
-    .exec-metric-label {{
-        color: #475569;
-        font-size: 0.95rem;
-    }}
-    .exec-metric-value {{
-        font-weight: 700;
-        color: #0f172a;
-        font-size: 1.1rem;
-    }}
-    .exec-divider {{
-        height: 1px;
-        background: #e2e8f0;
-        margin: 18px 0;
-    }}
+    .exec-metric-row {{ display: flex; justify-content: space-between; margin-bottom: 14px; }}
+    .exec-metric-label {{ color: #475569; font-size: 0.95rem; }}
+    .exec-metric-value {{ font-weight: 700; color: #0f172a; font-size: 1.1rem; }}
+    .exec-divider {{ height: 1px; background: #e2e8f0; margin: 18px 0; }}
     .exec-risk-card {{
-        background: #f8fafc;
-        border-radius: 16px;
-        padding: 16px 20px;
-        margin-bottom: 12px;
-        border-left: 6px solid;
+        background: #f8fafc; border-radius: 16px; padding: 16px 20px; margin-bottom: 12px; border-left: 6px solid;
     }}
     .exec-hero {{
         background: linear-gradient(145deg, {primary} 0%, {secondary} 100%);
-        border-radius: 28px;
-        padding: 28px 32px;
-        color: white;
-        margin-bottom: 24px;
+        border-radius: 28px; padding: 28px 32px; color: white; margin-bottom: 24px;
         box-shadow: 0 12px 32px rgba(14, 54, 92, 0.2);
     }}
     .exec-ai-brief {{
-        background: #f1f5f9;
-        border-radius: 18px;
-        padding: 20px 24px;
-        border-left: 8px solid {primary};
-        margin-bottom: 24px;
+        background: #f1f5f9; border-radius: 18px; padding: 20px 24px;
+        border-left: 8px solid {primary}; margin-bottom: 24px;
     }}
     .kpi-card {{
-        background: white;
-        border-radius: 16px;
-        padding: 18px 16px;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.04);
-        border: 1px solid #edf2f7;
-        height: 100%;
+        background: white; border-radius: 16px; padding: 18px 16px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.04); border: 1px solid #edf2f7; height: 100%;
     }}
-    .kpi-label {{
-        color: #64748b;
-        font-size: 0.9rem;
-        font-weight: 500;
-        letter-spacing: 0.3px;
-        margin-bottom: 8px;
-    }}
-    .kpi-value {{
-        color: #0f172a;
-        font-size: 2.2rem;
-        font-weight: 700;
-        line-height: 1.2;
-    }}
+    .kpi-label {{ color: #64748b; font-size: 0.9rem; font-weight: 500; letter-spacing: 0.3px; margin-bottom: 8px; }}
+    .kpi-value {{ color: #0f172a; font-size: 2.2rem; font-weight: 700; line-height: 1.2; }}
     .register-table {{
-        width: 100%;
-        border-collapse: collapse;
-        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-        font-size: 13px;
+        width: 100%; border-collapse: collapse; font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 13px;
     }}
     .register-table th {{
-        background-color: #f3f4f6;
-        color: #1f2937;
-        font-weight: 600;
-        border-bottom: 2px solid #d1d5db;
-        padding: 10px 8px;
-        text-align: left;
-        border-right: 1px solid #e5e7eb;
+        background-color: #f3f4f6; color: #1f2937; font-weight: 600; border-bottom: 2px solid #d1d5db;
+        padding: 10px 8px; text-align: left; border-right: 1px solid #e5e7eb;
     }}
     .register-table td {{
-        padding: 8px;
-        border-right: 1px solid #e5e7eb;
-        border-bottom: 1px solid #e5e7eb;
-        vertical-align: top;
+        padding: 8px; border-right: 1px solid #e5e7eb; border-bottom: 1px solid #e5e7eb; vertical-align: top;
     }}
     </style>
     """, unsafe_allow_html=True)
 
 def render_parser_audit_panel():
     if st.session_state.parser_audit:
-        with st.expander("🔍 Parser Audit & Diagnostics", expanded=False):
-            st.markdown("**Ingestion Confidence Report**")
+        with st.expander("🔍 Extraction Quality Dashboard", expanded=False):
             audit = st.session_state.parser_audit
-            col1, col2 = st.columns(2)
+            col1, col2, col3, col4 = st.columns(4)
             col1.metric("Files Processed", audit.get("total_files", 0))
-            col2.metric("Total Risks", audit.get("total_risks", 0))
+            col2.metric("Rows Scanned", audit.get("rows_scanned", 0))
+            col3.metric("Rows Accepted", audit.get("rows_accepted", 0))
+            col4.metric("Acceptance Rate", f"{audit.get('acceptance_rate', 0)}%")
+            col5, col6, col7 = st.columns(3)
+            col5.metric("Total Risks", audit.get("total_risks", 0))
+            col6.metric("Duplicates Removed", audit.get("duplicates_removed", 0))
+            col7.metric("Clusters Formed", audit.get("clusters_formed", 0))
 
 def render_sidebar():
     with st.sidebar:
@@ -1828,7 +1738,7 @@ def render_sidebar():
             col_apply, _ = st.columns([1, 2])
             with col_apply:
                 apply_btn = st.button("Apply Code", use_container_width=True)
-            
+
             if apply_btn:
                 if code == PRO_UNLOCK_CODE:
                     st.session_state.tier = "professional"
@@ -1868,7 +1778,103 @@ def main():
     apply_custom_theme(st.session_state.primary_color, st.session_state.secondary_color)
     render_sidebar()
 
-    # Premium Hero Header
+    # Hero state is now correctly synchronized below after processing
+
+    if GEMINI_AVAILABLE:
+        st.success("✅ Gemini API is configured and ready")
+    else:
+        st.error("❌ Gemini API key not found")
+
+    if st.session_state.tier == "free":
+        st.info("🔓 Free tier: 1 file, preview only. Upgrade for full features.")
+
+    max_files = 1 if st.session_state.tier == "free" else 999
+    uploaded_files = st.file_uploader("Upload risk registers (Excel/CSV)", accept_multiple_files=True, type=["xlsx", "xls", "csv"])
+
+    if len(uploaded_files) > max_files:
+        st.error(f"Free tier allows {max_files} file(s).")
+        uploaded_files = uploaded_files[:max_files]
+
+    if st.button("🚀 Generate Board Pack", type="primary", use_container_width=True):
+        if not uploaded_files:
+            st.warning("Please upload files.")
+        else:
+            with st.spinner("Processing risk registers..."):
+                df_all, debug_list = parse_all_files(uploaded_files, st.session_state.tier, st.session_state.default_residual_score)
+                if df_all.empty:
+                    st.error("No valid risk data found.")
+                    if st.session_state.debug_mode:
+                        st.subheader("🔧 Parser Debug Information")
+                        for i, debug in enumerate(debug_list):
+                            st.markdown(f"**File {i+1}**")
+                            st.json(debug)
+                else:
+                    st.success(f"✅ {len(df_all)} risks processed")
+                    if st.session_state.debug_mode:
+                        with st.expander("🔧 Parsed Risks Preview"):
+                            st.dataframe(df_all.head(20))
+
+                    category_appetite = st.session_state.category_appetite if st.session_state.tier == "enterprise" else None
+                    snapshot = build_intelligence_snapshot(df_all, st.session_state.board_threshold, category_appetite)
+                    comparison = {}
+                    trends = {}
+                    if st.session_state.history:
+                        comparison = compare_snapshots(snapshot, st.session_state.history[-1])
+                        trends = analyze_trends(snapshot, st.session_state.history[-1])
+
+                    correlations = find_cross_division_correlations(df_all)
+                    recommendations = recommend_appetite_thresholds(df_all, st.session_state.board_threshold)
+
+                    ai_summary = ""
+                    if st.session_state.tier != "free" and GEMINI_AVAILABLE:
+                        ai_summary = ai_executive_briefing(snapshot, correlations, recommendations, st.session_state.org_name)
+
+                    narrative = generate_board_narrative(snapshot, comparison, st.session_state.board_threshold, st.session_state.org_name, st.session_state.report_title, ai_summary)
+                    st.session_state.rf_data = {
+                        "risks_df": df_all,
+                        "total_risks": len(df_all),
+                        "company": st.session_state.org_name,
+                        "report_title": st.session_state.report_title,
+                        "period": f"Q{((datetime.now().month-1)//3)+1} {datetime.now().year}",
+                        "board_date": datetime.now().strftime("%B %d, %Y"),
+                        "threshold": st.session_state.board_threshold,
+                        "critical_count": snapshot.get("critical_count", 0),
+                        "high_count": snapshot.get("high_count", 0),
+                        "avg_residual": snapshot.get("avg_residual", 0),
+                        "avg_inherent": snapshot.get("avg_inherent", 0),
+                        "enterprise_health_score": snapshot.get("enterprise_health_score", 0),
+                        "treatment_confidence": snapshot.get("treatment_confidence", 0),
+                        "top_division": snapshot.get("top_division", "N/A"),
+                        "top_division_pct": snapshot.get("top_division_pct", 0),
+                        "division_exposure": snapshot.get("division_exposure", {}),
+                        "category_exposure": snapshot.get("category_exposure", {}),
+                        "ownership_coverage": snapshot.get("ownership_coverage", 0),
+                        "pct_within_appetite": snapshot.get("pct_within_appetite", 0),
+                        "pct_near_appetite": snapshot.get("pct_near_appetite", 0),
+                        "pct_breached": snapshot.get("pct_breached", 0),
+                        "emerging_themes": snapshot.get("emerging_themes", []),
+                        "board_risks": snapshot.get("board_risks", []),
+                        "narrative": narrative,
+                        "comparison": comparison,
+                        "trends": trends,
+                        "correlations": correlations,
+                        "recommendations": recommendations,
+                        "ai_summary": ai_summary
+                    }
+                    st.session_state.history.append(snapshot)
+                    if len(st.session_state.history) > 4:
+                        st.session_state.history = st.session_state.history[-4:]
+                    if st.session_state.tier != "free":
+                        excel_data = generate_intelligent_excel_pack(st.session_state.rf_data, narrative, correlations, trends)
+                        st.download_button("📥 Excel Board Pack", excel_data, file_name=f"RiskForge_{datetime.now().strftime('%Y%m%d')}.xlsx")
+                        if st.session_state.tier == "enterprise":
+                            pdf_data = generate_pdf_board_pack(narrative, snapshot, st.session_state.org_name, st.session_state.report_title, st.session_state.logo_bytes)
+                            st.download_button("📥 PDF Board Pack (Enterprise)", pdf_data, file_name=f"BoardPack_{datetime.now().strftime('%Y%m%d')}.pdf")
+                    else:
+                        st.info("📌 Upgrade to Professional/Enterprise to download board packs.")
+                    st.rerun()
+
+    # Hero header (now correctly after processing, uses st.session_state.rf_data)
     if st.session_state.rf_data:
         health = st.session_state.rf_data.get("enterprise_health_score", 0)
     else:
@@ -1916,105 +1922,12 @@ def main():
         """, unsafe_allow_html=True)
 
     render_parser_audit_panel()
-    
-    if GEMINI_AVAILABLE:
-        st.success("✅ Gemini API is configured and ready")
-    else:
-        st.error("❌ Gemini API key not found")
-    
-    if st.session_state.tier == "free":
-        st.info("🔓 Free tier: 1 file, preview only. Upgrade for full features.")
-    
-    max_files = 1 if st.session_state.tier == "free" else 999
-    uploaded_files = st.file_uploader("Upload risk registers (Excel/CSV)", accept_multiple_files=True, type=["xlsx", "xls", "csv"])
-    
-    if len(uploaded_files) > max_files:
-        st.error(f"Free tier allows {max_files} file(s).")
-        uploaded_files = uploaded_files[:max_files]
-    
-    if st.button("🚀 Generate Board Pack", type="primary", use_container_width=True):
-        if not uploaded_files:
-            st.warning("Please upload files.")
-        else:
-            with st.spinner("Processing risk registers..."):
-                df_all, debug_list = parse_all_files(uploaded_files, st.session_state.tier, st.session_state.default_residual_score)
-                if df_all.empty:
-                    st.error("No valid risk data found.")
-                    if st.session_state.debug_mode:
-                        st.subheader("🔧 Parser Debug Information")
-                        for i, debug in enumerate(debug_list):
-                            st.markdown(f"**File {i+1}**")
-                            st.json(debug)
-                else:
-                    st.success(f"✅ {len(df_all)} risks processed")
-                    if st.session_state.debug_mode:
-                        with st.expander("🔧 Parsed Risks Preview"):
-                            st.dataframe(df_all.head(20))
-                    
-                    category_appetite = st.session_state.category_appetite if st.session_state.tier == "enterprise" else None
-                    snapshot = build_intelligence_snapshot(df_all, st.session_state.board_threshold, category_appetite)
-                    comparison = {}
-                    trends = {}
-                    if st.session_state.history:
-                        comparison = compare_snapshots(snapshot, st.session_state.history[-1])
-                        trends = analyze_trends(snapshot, st.session_state.history[-1])
-                    
-                    correlations = find_cross_division_correlations(df_all)
-                    recommendations = recommend_appetite_thresholds(df_all, st.session_state.board_threshold)
-                    
-                    ai_summary = ""
-                    if st.session_state.tier != "free" and GEMINI_AVAILABLE:
-                        ai_summary = ai_executive_briefing(snapshot, correlations, recommendations, st.session_state.org_name)
-                    
-                    narrative = generate_board_narrative(snapshot, comparison, st.session_state.board_threshold, st.session_state.org_name, st.session_state.report_title, ai_summary)
-                    st.session_state.rf_data = {
-                        "risks_df": df_all,
-                        "total_risks": len(df_all),
-                        "company": st.session_state.org_name,
-                        "report_title": st.session_state.report_title,
-                        "period": f"Q{((datetime.now().month-1)//3)+1} {datetime.now().year}",
-                        "board_date": datetime.now().strftime("%B %d, %Y"),
-                        "threshold": st.session_state.board_threshold,
-                        "critical_count": snapshot.get("critical_count", 0),
-                        "high_count": snapshot.get("high_count", 0),
-                        "avg_residual": snapshot.get("avg_residual", 0),
-                        "avg_inherent": snapshot.get("avg_inherent", 0),
-                        "enterprise_health_score": snapshot.get("enterprise_health_score", 0),
-                        "treatment_confidence": snapshot.get("treatment_confidence", 0),
-                        "top_division": snapshot.get("top_division", "N/A"),
-                        "top_division_pct": snapshot.get("top_division_pct", 0),
-                        "division_exposure": snapshot.get("division_exposure", {}),
-                        "category_exposure": snapshot.get("category_exposure", {}),
-                        "ownership_coverage": snapshot.get("ownership_coverage", 0),
-                        "pct_within_appetite": snapshot.get("pct_within_appetite", 0),
-                        "pct_near_appetite": snapshot.get("pct_near_appetite", 0),
-                        "pct_breached": snapshot.get("pct_breached", 0),
-                        "emerging_themes": snapshot.get("emerging_themes", []),
-                        "board_risks": snapshot.get("board_risks", []),
-                        "narrative": narrative,
-                        "comparison": comparison,
-                        "trends": trends,
-                        "correlations": correlations,
-                        "recommendations": recommendations,
-                        "ai_summary": ai_summary
-                    }
-                    st.session_state.history.append(snapshot)
-                    if len(st.session_state.history) > 4:
-                        st.session_state.history = st.session_state.history[-4:]
-                    if st.session_state.tier != "free":
-                        excel_data = generate_intelligent_excel_pack(st.session_state.rf_data, narrative, correlations, trends)
-                        st.download_button("📥 Excel Board Pack", excel_data, file_name=f"RiskForge_{datetime.now().strftime('%Y%m%d')}.xlsx")
-                        if st.session_state.tier == "enterprise":
-                            pdf_data = generate_pdf_board_pack(narrative, snapshot, st.session_state.org_name, st.session_state.report_title, st.session_state.logo_bytes)
-                            st.download_button("📥 PDF Board Pack (Enterprise)", pdf_data, file_name=f"BoardPack_{datetime.now().strftime('%Y%m%d')}.pdf")
-                    else:
-                        st.info("📌 Upgrade to Professional/Enterprise to download board packs.")
-    
+
     if st.session_state.rf_data:
         data = st.session_state.rf_data
         df = data["risks_df"]
         tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "📑 Register", "🧠 Intelligence", "📈 Trends", "📤 Export"])
-        
+
         with tab1:
             st.subheader("Executive Dashboard")
             col1, col2, col3, col4, col5 = st.columns(5)
@@ -2079,28 +1992,15 @@ def main():
             st.subheader("Risk Appetite Status")
             st.progress(data.get("pct_within_appetite", 0) / 100)
             st.caption(f"Within: {data.get('pct_within_appetite', 0)}% | Near: {data.get('pct_near_appetite', 0)}% | Breached: {data.get('pct_breached', 0)}%")
-        
+
         with tab2:
             st.subheader("Enterprise Risk Register")
 
             register_cols = [
-                "division",
-                "risk_no",
-                "risk_name",
-                "risk_statement",
-                "cause",
-                "category",
-                "impact_score",
-                "likelihood_score",
-                "inherent_score",
-                "controls",
-                "control_effectiveness",
-                "owner",
-                "strategy",
-                "treatment_plan",
-                "due_date_raw",
-                "residual_score",
-                "residual_level",
+                "division", "risk_no", "risk_name", "risk_statement", "cause", "category",
+                "impact_score", "likelihood_score", "inherent_score", "controls",
+                "control_effectiveness", "owner", "strategy", "treatment_plan",
+                "due_date_raw", "residual_score", "residual_level",
             ]
 
             display_df = df.copy()
@@ -2178,6 +2078,10 @@ def main():
             html_table += '</tbody></table>'
 
             st.markdown(html_table, unsafe_allow_html=True)
+
+            with st.expander("🔍 Risk Lineage & Confidence"):
+                lineage_df = df[["risk_name", "source_file", "source_sheet", "source_row", "acceptance_score", "acceptance_reason", "parser_confidence"]].copy()
+                st.dataframe(lineage_df, use_container_width=True)
 
         with tab3:
             if data.get("ai_summary"):
@@ -2367,7 +2271,6 @@ def main():
                     </div>
                     """, unsafe_allow_html=True)
 
-            # Cross-Division Correlations
             correlations = data.get("correlations", [])
             if correlations:
                 with st.expander("🔗 Cross‑Division Risk Correlations", expanded=True):
@@ -2382,7 +2285,6 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
 
-            # Threshold Recommendations
             recommendations = data.get("recommendations", {})
             if recommendations:
                 with st.expander("🎯 Appetite Threshold Recommendations", expanded=False):
@@ -2471,7 +2373,7 @@ def main():
                     st.markdown(f"**Appetite Breach Change:** {abs(comp['appetite_delta']):.1f}% {direction}")
             else:
                 st.info("Upload another register next quarter to see trend analysis.")
-            
+
             trends = data.get("trends", {})
             if trends:
                 with st.expander("📈 Advanced Trend Analysis", expanded=False):
@@ -2482,7 +2384,7 @@ def main():
                     if trends.get("fastest_growing_category"):
                         fgc = trends["fastest_growing_category"]
                         st.markdown(f"**Fastest Growing Risk Category:** {fgc['category']} (+{fgc['growth_pct']}%)")
-        
+
         with tab5:
             st.subheader("Export Options")
             if st.session_state.tier != "free":
