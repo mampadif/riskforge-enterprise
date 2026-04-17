@@ -22,12 +22,12 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.units import inch
 from rapidfuzz import fuzz
 
-# Optional imports
+# Optional imports – if sentence_transformers fails due to missing torchvision, we disable it
 try:
     from sentence_transformers import SentenceTransformer
     from sklearn.metrics.pairwise import cosine_similarity
     EMBEDDING_AVAILABLE = True
-except ImportError:
+except (ImportError, ModuleNotFoundError):
     EMBEDDING_AVAILABLE = False
 
 # =============================================================================
@@ -210,12 +210,11 @@ def clean_division_value(val: Any) -> str:
     )
     text = re.sub(r"\s+", " ", text).strip(" :-")
 
-    # Only map very common abbreviations
     abbrev_map = {
         "hr": "Human Resources",
         "it": "Information Technology",
         "ict": "Information Technology",
-        "ist": "Information Systems Technology",   # optional: you can remove if you prefer "Ist"
+        "ist": "Information Systems Technology",
     }
 
     key = text.lower()
@@ -242,10 +241,6 @@ def looks_like_category(text: str) -> bool:
     return normalize_text(text).lower() in categories
 
 def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: int = 12) -> Optional[str]:
-    """
-    Detect real division/dept from the metadata area ABOVE the table header.
-    Avoid picking category values like Strategic or Financial.
-    """
     label_regex = re.compile(
         r"^(division\/dept|division|department|dept|directorate|function|unit)\s*[:\-]?$",
         re.I
@@ -263,11 +258,9 @@ def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: in
             if label_regex.match(label):
                 candidates = []
 
-                # same row, nearby right cells
                 for offset in range(1, 6):
                     candidates.append(merged_cell_value(ws, r, c + offset))
 
-                # next row, same col and nearby right cells
                 for offset in range(0, 6):
                     candidates.append(merged_cell_value(ws, r + 1, c + offset))
 
@@ -302,8 +295,6 @@ def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: in
     return None
 
 def extract_division_from_sheet_context(file_name: str, sheet_name: str, header_preview: List[str]) -> str:
-    # Use only the filename/sheetname as the fallback division.
-    # Remove "risk register" and similar suffixes.
     name = sheet_name if sheet_name else file_name
     name = re.sub(r"(?i)\brisk\s*register\b", "", name)
     name = re.sub(r"(?i)\bconsolidated\b", "", name)
@@ -406,7 +397,7 @@ def infer_category_from_text(title: str, statement: str, cause: str, raw_categor
     return "Operational"
 
 # =============================================================================
-# SHEET / HEADER DISCOVERY (EXPANDED)
+# SHEET / HEADER DISCOVERY
 # =============================================================================
 FIELD_PATTERNS: Dict[str, List[str]] = {
     "risk_no": [r"risk\s*no", r"risk\s*id", r"identifier"],
@@ -754,7 +745,7 @@ def parse_structured_sheet(
     return pd.DataFrame(risks), debug
 
 # =============================================================================
-# UNIVERSAL PARSER ENTRY POINT (PARSES UP TO 3 SHEETS)
+# UNIVERSAL PARSER ENTRY POINT
 # =============================================================================
 def parse_structured_risk_register(
     file_bytes: bytes,
@@ -1624,26 +1615,40 @@ def render_sidebar():
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("$29/mo", key="pro_monthly"):
-                    if stripe and STRIPE_PRICE_ID_PRO_MONTHLY:
-                        session = stripe.checkout.Session.create(
-                            payment_method_types=["card"],
-                            line_items=[{"price": STRIPE_PRICE_ID_PRO_MONTHLY, "quantity": 1}],
-                            mode="subscription",
-                            success_url=APP_URL + "?success_pro_monthly=true",
-                            cancel_url=APP_URL,
-                        )
-                        st.markdown(f"<a href='{session.url}' target='_blank'>Pay</a>", unsafe_allow_html=True)
+                    if not stripe or not STRIPE_SECRET_KEY:
+                        st.error("Stripe is not configured.")
+                    elif not STRIPE_PRICE_ID_PRO_MONTHLY:
+                        st.error("Professional monthly price ID missing.")
+                    else:
+                        try:
+                            session = stripe.checkout.Session.create(
+                                payment_method_types=["card"],
+                                line_items=[{"price": STRIPE_PRICE_ID_PRO_MONTHLY, "quantity": 1}],
+                                mode="subscription",
+                                success_url=APP_URL + "?success_pro_monthly=true",
+                                cancel_url=APP_URL,
+                            )
+                            st.markdown(f"<a href='{session.url}' target='_blank'>Pay</a>", unsafe_allow_html=True)
+                        except Exception as e:
+                            st.error(f"Stripe error: {e}")
             with col2:
                 if st.button("$99/yr", key="pro_annual"):
-                    if stripe and STRIPE_PRICE_ID_PRO_ANNUAL:
-                        session = stripe.checkout.Session.create(
-                            payment_method_types=["card"],
-                            line_items=[{"price": STRIPE_PRICE_ID_PRO_ANNUAL, "quantity": 1}],
-                            mode="subscription",
-                            success_url=APP_URL + "?success_pro_annual=true",
-                            cancel_url=APP_URL,
-                        )
-                        st.markdown(f"<a href='{session.url}' target='_blank'>Pay</a>", unsafe_allow_html=True)
+                    if not stripe or not STRIPE_SECRET_KEY:
+                        st.error("Stripe is not configured.")
+                    elif not STRIPE_PRICE_ID_PRO_ANNUAL:
+                        st.error("Professional annual price ID missing.")
+                    else:
+                        try:
+                            session = stripe.checkout.Session.create(
+                                payment_method_types=["card"],
+                                line_items=[{"price": STRIPE_PRICE_ID_PRO_ANNUAL, "quantity": 1}],
+                                mode="subscription",
+                                success_url=APP_URL + "?success_pro_annual=true",
+                                cancel_url=APP_URL,
+                            )
+                            st.markdown(f"<a href='{session.url}' target='_blank'>Pay</a>", unsafe_allow_html=True)
+                        except Exception as e:
+                            st.error(f"Stripe error: {e}")
             st.markdown("")
             st.markdown("""
 **Enterprise** – $99/month or $299/year  
@@ -1656,26 +1661,40 @@ def render_sidebar():
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("$99/mo", key="ent_monthly"):
-                    if stripe and STRIPE_PRICE_ID_ENT_MONTHLY:
-                        session = stripe.checkout.Session.create(
-                            payment_method_types=["card"],
-                            line_items=[{"price": STRIPE_PRICE_ID_ENT_MONTHLY, "quantity": 1}],
-                            mode="subscription",
-                            success_url=APP_URL + "?success_ent_monthly=true",
-                            cancel_url=APP_URL,
-                        )
-                        st.markdown(f"<a href='{session.url}' target='_blank'>Pay</a>", unsafe_allow_html=True)
+                    if not stripe or not STRIPE_SECRET_KEY:
+                        st.error("Stripe is not configured.")
+                    elif not STRIPE_PRICE_ID_ENT_MONTHLY:
+                        st.error("Enterprise monthly price ID missing.")
+                    else:
+                        try:
+                            session = stripe.checkout.Session.create(
+                                payment_method_types=["card"],
+                                line_items=[{"price": STRIPE_PRICE_ID_ENT_MONTHLY, "quantity": 1}],
+                                mode="subscription",
+                                success_url=APP_URL + "?success_ent_monthly=true",
+                                cancel_url=APP_URL,
+                            )
+                            st.markdown(f"<a href='{session.url}' target='_blank'>Pay</a>", unsafe_allow_html=True)
+                        except Exception as e:
+                            st.error(f"Stripe error: {e}")
             with col2:
                 if st.button("$299/yr", key="ent_annual"):
-                    if stripe and STRIPE_PRICE_ID_ENT_ANNUAL:
-                        session = stripe.checkout.Session.create(
-                            payment_method_types=["card"],
-                            line_items=[{"price": STRIPE_PRICE_ID_ENT_ANNUAL, "quantity": 1}],
-                            mode="subscription",
-                            success_url=APP_URL + "?success_ent_annual=true",
-                            cancel_url=APP_URL,
-                        )
-                        st.markdown(f"<a href='{session.url}' target='_blank'>Pay</a>", unsafe_allow_html=True)
+                    if not stripe or not STRIPE_SECRET_KEY:
+                        st.error("Stripe is not configured.")
+                    elif not STRIPE_PRICE_ID_ENT_ANNUAL:
+                        st.error("Enterprise annual price ID missing.")
+                    else:
+                        try:
+                            session = stripe.checkout.Session.create(
+                                payment_method_types=["card"],
+                                line_items=[{"price": STRIPE_PRICE_ID_ENT_ANNUAL, "quantity": 1}],
+                                mode="subscription",
+                                success_url=APP_URL + "?success_ent_annual=true",
+                                cancel_url=APP_URL,
+                            )
+                            st.markdown(f"<a href='{session.url}' target='_blank'>Pay</a>", unsafe_allow_html=True)
+                        except Exception as e:
+                            st.error(f"Stripe error: {e}")
             st.markdown("---")
             code = st.text_input("Unlock code", type="password")
             if code == PRO_UNLOCK_CODE:
@@ -1712,7 +1731,7 @@ def main():
     apply_custom_theme(st.session_state.primary_color, st.session_state.secondary_color)
     render_sidebar()
 
-    # Premium Hero Header (updates automatically after parsing)
+    # Premium Hero Header
     if st.session_state.rf_data:
         health = st.session_state.rf_data.get("enterprise_health_score", 0)
     else:
