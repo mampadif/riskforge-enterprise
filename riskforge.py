@@ -1,5 +1,4 @@
 import streamlit as st
-import google.generativeai as genai
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -23,12 +22,12 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.units import inch
 from rapidfuzz import fuzz, process
 
-# Optional imports – if sentence_transformers fails due to missing torchvision, we disable it
+# Optional sentence-transformers for semantic deduplication (falls back gracefully)
 try:
     from sentence_transformers import SentenceTransformer
     from sklearn.metrics.pairwise import cosine_similarity
     EMBEDDING_AVAILABLE = True
-except (ImportError, ModuleNotFoundError):
+except ImportError:
     EMBEDDING_AVAILABLE = False
 
 # =============================================================================
@@ -36,7 +35,7 @@ except (ImportError, ModuleNotFoundError):
 # =============================================================================
 st.set_page_config(page_title="RiskForge Enterprise", page_icon="🛡️", layout="wide")
 
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
+# Stripe & secrets (only for payment; unlock codes work without Stripe)
 STRIPE_SECRET_KEY = st.secrets.get("STRIPE_SECRET_KEY")
 STRIPE_PRICE_ID_PRO_MONTHLY = st.secrets.get("FORGE_STRIPE_PRICE_ID_PRO_MONTHLY")
 STRIPE_PRICE_ID_PRO_ANNUAL = st.secrets.get("FORGE_STRIPE_PRICE_ID_PRO_ANNUAL")
@@ -45,14 +44,6 @@ STRIPE_PRICE_ID_ENT_ANNUAL = st.secrets.get("FORGE_STRIPE_PRICE_ID_ENT_ANNUAL")
 APP_URL = st.secrets.get("APP_URL", "https://your-app.streamlit.app")
 PRO_UNLOCK_CODE = st.secrets.get("PRO_UNLOCK_CODE", "PRO2025")
 ENT_UNLOCK_CODE = st.secrets.get("ENT_UNLOCK_CODE", "ENT2025")
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    GEMINI_AVAILABLE = True
-    ai_model = genai.GenerativeModel("gemini-2.0-flash")
-else:
-    GEMINI_AVAILABLE = False
-    ai_model = None
 
 stripe.api_key = STRIPE_SECRET_KEY if STRIPE_SECRET_KEY else None
 
@@ -85,8 +76,6 @@ if "parser_audit" not in st.session_state:
     st.session_state.parser_audit = None
 if "debug_mode" not in st.session_state:
     st.session_state.debug_mode = False
-if "force_gemini" not in st.session_state:
-    st.session_state.force_gemini = True
 
 def handle_payment_success(plan: str):
     if plan in ("pro_monthly", "pro_annual"):
@@ -184,14 +173,13 @@ def parse_due_date(val: Any) -> Optional[date]:
     return None
 
 def is_year_like(text: str) -> bool:
-    """Reject values like '2025-26', '2024/25', '2023 24'."""
     if not text:
         return False
     t = text.strip()
     patterns = [
-        r"^\d{4}[\-/ ]?\d{2}$",      # 2025-26, 2024/25, 2023 24
-        r"^\d{4}$",                  # 2025
-        r"^\d{2}[\-/]\d{2}$",        # 25-26
+        r"^\d{4}[\-/ ]?\d{2}$",
+        r"^\d{4}$",
+        r"^\d{2}[\-/]\d{2}$",
     ]
     for pat in patterns:
         if re.match(pat, t):
@@ -237,7 +225,6 @@ def looks_like_category(text: str) -> bool:
     return normalize_text(text).lower() in categories
 
 def infer_division_from_filename(file_name: str) -> Dict[str, Any]:
-    """Extract division from filename with confidence and source."""
     if not file_name:
         return {"division": "Unknown Division", "confidence": 0.0, "source": "filename"}
 
@@ -299,7 +286,6 @@ def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: in
     return None
 
 def get_division_for_risk(file_name: str, sheet_name: str, explicit: Optional[Dict[str, Any]]) -> Tuple[str, str, float]:
-    """Return (division, source, confidence)."""
     if explicit:
         return explicit["division"], explicit["source"], explicit["confidence"]
 
@@ -480,10 +466,9 @@ def rank_candidate_sheets(wb) -> List[Dict[str, Any]]:
     return candidates
 
 # =============================================================================
-# ROW ACCEPTANCE SCORING (INTELLIGENCE LAYER)
+# ROW ACCEPTANCE SCORING
 # =============================================================================
 def is_valid_risk_record(row: Dict[str, Any]) -> Tuple[bool, int, str]:
-    """Returns (is_valid, confidence_score, reason)."""
     evidence = 0
     reasons = []
 
@@ -563,46 +548,6 @@ def merge_continuation_rows(rows: List[Dict]) -> List[Dict]:
         merged.append(current)
     return merged
 
-def compute_scores(
-    raw_impact: Any,
-    raw_likelihood: Any,
-    raw_inherent: Any,
-    raw_residual: Any,
-    raw_control_effectiveness: Any,
-    default_residual: int
-) -> Tuple[int, int, Optional[float], Optional[float], Optional[int], str]:
-    impact_score = parse_risk_score(raw_impact)
-    likelihood_score = parse_risk_score(raw_likelihood)
-    inherent_score = parse_risk_score(raw_inherent)
-    residual_score = parse_risk_score(raw_residual)
-
-    control_eff_numeric = parse_control_effectiveness(raw_control_effectiveness)
-    control_eff_text = normalize_text(raw_control_effectiveness) or "Not rated"
-
-    if inherent_score is not None and inherent_score > 5:
-        inherent = float(inherent_score)
-    elif impact_score is not None and likelihood_score is not None:
-        inherent = float(impact_score * likelihood_score)
-    elif impact_score is not None:
-        inherent = float(impact_score * 5)
-    elif likelihood_score is not None:
-        inherent = float(likelihood_score * 5)
-    else:
-        inherent = float(default_residual)
-
-    inherent = min(25, max(1, round(inherent)))
-
-    if residual_score is not None and residual_score > 5:
-        residual = float(residual_score)
-    elif control_eff_numeric is not None:
-        residual = round(inherent * (control_eff_numeric / 5.0))
-    else:
-        residual = inherent
-
-    residual = min(25, max(1, round(residual)))
-
-    return residual, inherent, impact_score, likelihood_score, control_eff_numeric, control_eff_text
-
 def parse_risk_score(val: Any) -> Optional[float]:
     if val is None:
         return None
@@ -634,7 +579,8 @@ def parse_risk_score(val: Any) -> Optional[float]:
             return num
     return None
 
-def parse_control_effectiveness(val: Any) -> Optional[int]:
+def parse_control_effectiveness(val: Any) -> Optional[float]:
+    """Parse control effectiveness to a factor between 0.0 and 1.0."""
     if val is None:
         return None
     try:
@@ -645,19 +591,88 @@ def parse_control_effectiveness(val: Any) -> Optional[int]:
 
     s = normalize_text(val).lower()
     mapping = {
-        "very good": 1, "good": 2, "satisfactory": 3,
-        "moderate": 3, "weak": 4, "unsatisfactory": 5, "ineffective": 5,
+        "very good": 0.8,
+        "good": 0.6,
+        "satisfactory": 0.4,
+        "moderate": 0.4,
+        "weak": 0.2,
+        "unsatisfactory": 0.1,
+        "ineffective": 0.1,
     }
     for key, num in mapping.items():
         if key in s:
             return num
 
-    match = re.search(r"(\d+)", s)
+    match = re.search(r"(\d+(?:\.\d+)?)", s)
     if match:
-        num = int(match.group(1))
-        if 1 <= num <= 5:
+        num = float(match.group(1))
+        if 0 <= num <= 1:
             return num
+        elif 1 < num <= 5:
+            return (num - 1) / 4.0  # map 1-5 to 0.0-1.0
     return None
+
+def infer_impact_likelihood_from_inherent(inherent: float) -> Tuple[float, float]:
+    """Back-project inherent score to a plausible impact/likelihood pair."""
+    if inherent <= 0:
+        return 1.0, 1.0
+    # Common grid pairs for 5x5 matrix
+    pairs = [
+        (5, 4), (4, 5), (5, 3), (3, 5), (4, 4),
+        (4, 3), (3, 4), (3, 3), (5, 2), (2, 5),
+        (4, 2), (2, 4), (3, 2), (2, 3), (2, 2),
+        (5, 1), (1, 5), (4, 1), (1, 4), (3, 1), (1, 3)
+    ]
+    best_pair = (3, 3)
+    best_diff = float('inf')
+    for i, l in pairs:
+        diff = abs(i * l - inherent)
+        if diff < best_diff:
+            best_diff = diff
+            best_pair = (i, l)
+    return float(best_pair[0]), float(best_pair[1])
+
+def compute_scores(
+    raw_impact: Any,
+    raw_likelihood: Any,
+    raw_inherent: Any,
+    raw_control_effectiveness: Any,
+    default_residual: int
+) -> Tuple[int, int, float, float, float, str]:
+    impact_score = parse_risk_score(raw_impact)
+    likelihood_score = parse_risk_score(raw_likelihood)
+    inherent_score = parse_risk_score(raw_inherent)
+
+    control_eff_factor = parse_control_effectiveness(raw_control_effectiveness)
+    control_eff_text = normalize_text(raw_control_effectiveness) or "Not rated"
+
+    # Determine inherent
+    if inherent_score is not None and inherent_score > 5:
+        inherent = float(inherent_score)
+    elif impact_score is not None and likelihood_score is not None:
+        inherent = float(impact_score * likelihood_score)
+    elif impact_score is not None:
+        inherent = float(impact_score * 5)
+    elif likelihood_score is not None:
+        inherent = float(likelihood_score * 5)
+    else:
+        inherent = float(default_residual)
+
+    inherent = min(25, max(1, round(inherent)))
+
+    # Infer missing impact/likelihood
+    if impact_score is None or likelihood_score is None:
+        impact_score, likelihood_score = infer_impact_likelihood_from_inherent(inherent)
+
+    # Residual = Inherent × (1 − Control Effectiveness)
+    if control_eff_factor is not None:
+        residual = round(inherent * (1.0 - control_eff_factor))
+    else:
+        residual = inherent
+
+    residual = min(25, max(1, residual))
+
+    return residual, inherent, impact_score, likelihood_score, control_eff_factor, control_eff_text
 
 def parse_structured_sheet(
     ws,
@@ -692,7 +707,6 @@ def parse_structured_sheet(
         raw_impact_text = get_field(row_idx, "impact_text")
         raw_likelihood_text = get_field(row_idx, "likelihood_text")
         raw_inherent_text = get_field(row_idx, "inherent_text")
-        raw_residual_text = get_field(row_idx, "residual_text")
         raw_controls = get_field(row_idx, "controls")
         raw_control_eff = get_field(row_idx, "control_effectiveness_text")
         raw_owner = get_field(row_idx, "owner")
@@ -709,7 +723,7 @@ def parse_structured_sheet(
         category_raw = normalize_text(raw_category)
         controls = normalize_text(raw_controls)
         owner = normalize_text(raw_owner)
-        strategy = normalize_text(raw_strategy)
+        strategy = normalize_text(raw_strategy) or "Treat"
         treatment = normalize_text(raw_treatment)
         status = normalize_text(raw_status) or "Active"
         due_date_raw = normalize_text(raw_due_date)
@@ -734,11 +748,10 @@ def parse_structured_sheet(
         if risk_name.startswith("=") or risk_statement.startswith("="):
             continue
 
-        residual, inherent, impact_score, likelihood_score, control_eff_numeric, control_eff_text = compute_scores(
+        residual, inherent, impact_score, likelihood_score, control_eff_factor, control_eff_text = compute_scores(
             raw_impact=raw_impact_text,
             raw_likelihood=raw_likelihood_text,
             raw_inherent=raw_inherent_text,
-            raw_residual=raw_residual_text,
             raw_control_effectiveness=raw_control_eff,
             default_residual=default_residual,
         )
@@ -761,18 +774,18 @@ def parse_structured_sheet(
             "risk_statement": risk_statement,
             "cause": cause,
             "category": category,
-            "residual_score": residual,
             "inherent_score": inherent,
+            "residual_score": residual,
+            "impact_score": impact_score,
+            "likelihood_score": likelihood_score,
             "owner": owner or "Not assigned",
             "status": status,
             "due_date": parsed_due_date,
             "due_date_raw": due_date_raw,
-            "control_effectiveness": control_eff_text,
-            "control_effectiveness_numeric": control_eff_numeric,
-            "impact_score": impact_score,
-            "likelihood_score": likelihood_score,
             "controls": controls,
-            "strategy": strategy or "Treat",
+            "control_effectiveness": control_eff_text,
+            "control_effectiveness_factor": control_eff_factor,
+            "strategy": strategy,
             "treatment_plan": treatment,
             "source_file": file_name,
             "source_sheet": sheet_name,
@@ -818,7 +831,7 @@ def parse_structured_sheet(
     return pd.DataFrame(accepted_risks), debug
 
 # =============================================================================
-# UNIVERSAL PARSER ENTRY POINT (SINGLE BEST SHEET)
+# UNIVERSAL PARSER ENTRY POINT
 # =============================================================================
 def parse_structured_risk_register(
     file_bytes: bytes,
@@ -826,7 +839,7 @@ def parse_structured_risk_register(
     default_residual: int
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     debug_info: Dict[str, Any] = {
-        "parser": "intelligent_structured_v8",
+        "parser": "intelligent_structured_v10",
         "candidate_sheets": [],
         "selected_sheets": [],
         "error": None,
@@ -934,17 +947,17 @@ def simple_fallback_parser(
                                     "risk_statement": text[:500],
                                     "cause": "",
                                     "category": "Uncategorised",
+                                    "inherent_score": default_residual,
                                     "residual_score": default_residual,
-                                    "inherent_score": min(25, default_residual + 3),
+                                    "impact_score": 3.0,
+                                    "likelihood_score": 3.0,
                                     "owner": "Not assigned",
                                     "status": "Active",
                                     "due_date": None,
                                     "due_date_raw": "",
-                                    "control_effectiveness": "Not rated",
-                                    "control_effectiveness_numeric": None,
-                                    "impact_score": None,
-                                    "likelihood_score": None,
                                     "controls": "",
+                                    "control_effectiveness": "Not rated",
+                                    "control_effectiveness_factor": None,
                                     "strategy": "Treat",
                                     "treatment_plan": "",
                                     "source_file": file_name,
@@ -973,82 +986,6 @@ def simple_fallback_parser(
     return pd.DataFrame(), debug_info
 
 # =============================================================================
-# GEMINI FALLBACK
-# =============================================================================
-def gemini_extract_risks(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict]:
-    if not GEMINI_AVAILABLE:
-        return pd.DataFrame(), {"error": "Gemini not available"}
-    try:
-        xls = pd.ExcelFile(io.BytesIO(file_bytes))
-        all_content = []
-        for sheet in xls.sheet_names:
-            if sheet.lower() in ["boundaries", "impact", "likelihood", "effectiveness", "risk matrix"]:
-                continue
-            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None)
-            sheet_str = f"\n[SHEET: {sheet}]\n"
-            for i in range(min(50, df.shape[0])):
-                row_vals = []
-                for j in range(min(20, df.shape[1])):
-                    val = df.iat[i, j]
-                    if pd.notna(val) and str(val).strip():
-                        row_vals.append(str(val).strip())
-                if row_vals:
-                    sheet_str += f"Row {i+1}: {' | '.join(row_vals)}\n"
-            all_content.append(sheet_str)
-        content = "\n".join(all_content)[:8000]
-        prompt = f"""
-You are a risk extraction engine. Extract ALL risks as a JSON list.
-Each risk must have: risk_statement, risk_name, owner, residual_score (1-25).
-Return ONLY valid JSON.
-Content:
-{content}
-"""
-        response = ai_model.generate_content(prompt)
-        text = response.text.strip()
-        if text.startswith("```json"): text = text[7:]
-        if text.startswith("```"): text = text[3:]
-        if text.endswith("```"): text = text[:-3]
-        data = json.loads(text)
-        risks = data.get("risks", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        rows = []
-        for r in risks:
-            stmt = r.get("risk_statement", "")
-            if not stmt or len(stmt) < 15:
-                continue
-            inferred = infer_division_from_filename(file_name)
-            division_name = inferred["division"]
-            division_source = inferred["source"]
-            division_conf = inferred["confidence"]
-            row = {
-                "division": division_name,
-                "division_source": division_source,
-                "division_confidence": division_conf,
-                "risk_name": r.get("risk_name", stmt[:50]),
-                "risk_statement": stmt[:500],
-                "category": "Uncategorised",
-                "residual_score": min(25, max(1, int(r.get("residual_score", default_residual)))),
-                "inherent_score": min(25, int(r.get("residual_score", default_residual)) + 3),
-                "owner": r.get("owner", "Not assigned"),
-                "status": "Active",
-                "due_date": None,
-                "control_effectiveness": "Not rated",
-                "impact_score": r.get("impact_score"),
-                "likelihood_score": r.get("likelihood_score"),
-                "source_file": file_name,
-                "source_sheet": "gemini",
-                "source_row": 0,
-                "acceptance_score": 5,
-                "acceptance_reason": "gemini_extracted",
-                "parser_confidence": 0.80,
-            }
-            rows.append(row)
-        if rows:
-            return pd.DataFrame(rows), {"extracted": len(rows), "method": "gemini"}
-        return pd.DataFrame(), {"error": "No risks found"}
-    except Exception as e:
-        return pd.DataFrame(), {"error": f"Gemini failed: {str(e)}"}
-
-# =============================================================================
 # FINAL DISPATCHER
 # =============================================================================
 def parse_uploaded_file_bytes(
@@ -1066,17 +1003,10 @@ def parse_uploaded_file_bytes(
         st.warning(f"⚠️ Simple fallback extracted {len(df)} potential risks")
         return df, fallback_debug
 
-    if GEMINI_AVAILABLE and st.session_state.force_gemini:
-        df, gemini_debug = gemini_extract_risks(file_bytes, file_name, default_residual)
-        if not df.empty:
-            st.success(f"✅ Gemini extracted {len(df)} risks")
-            return df, gemini_debug
-        return pd.DataFrame(), gemini_debug
-
     return pd.DataFrame(), debug
 
 # =============================================================================
-# ENTERPRISE REGISTER BUILDING (WITH CONFIDENCE SCORING)
+# ENTERPRISE REGISTER BUILDING (WITH CONTROLS & TREATMENT)
 # =============================================================================
 def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if raw_df.empty:
@@ -1086,9 +1016,18 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
     names = raw_df["risk_name"].fillna("").tolist()
     divisions = raw_df["division"].tolist()
     categories = raw_df["category"].tolist()
-    residual_scores = raw_df["residual_score"].tolist()
     inherent_scores = raw_df["inherent_score"].tolist()
+    residual_scores = raw_df["residual_score"].tolist()
+    impact_scores = raw_df["impact_score"].tolist()
+    likelihood_scores = raw_df["likelihood_score"].tolist()
     owners = raw_df["owner"].tolist()
+    strategies = raw_df["strategy"].tolist()
+    treatments = raw_df["treatment_plan"].tolist()
+    statuses = raw_df["status"].tolist()
+    due_dates = raw_df["due_date"].tolist()
+    controls_list = raw_df["controls"].tolist()
+    control_eff_texts = raw_df["control_effectiveness"].tolist()
+    control_eff_factors = raw_df["control_effectiveness_factor"].tolist()
     acceptance_scores = raw_df["acceptance_score"].tolist()
     parser_confidences = raw_df["parser_confidence"].tolist()
     division_confidences = raw_df["division_confidence"].tolist()
@@ -1121,9 +1060,18 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         cluster_stmts = [statements[idx] for idx in indices]
         cluster_divisions = [divisions[idx] for idx in indices]
         cluster_categories = [categories[idx] for idx in indices]
-        cluster_residuals = [residual_scores[idx] for idx in indices]
         cluster_inherents = [inherent_scores[idx] for idx in indices]
+        cluster_residuals = [residual_scores[idx] for idx in indices]
+        cluster_impacts = [impact_scores[idx] for idx in indices]
+        cluster_likelihoods = [likelihood_scores[idx] for idx in indices]
         cluster_owners = [owners[idx] for idx in indices]
+        cluster_strategies = [strategies[idx] for idx in indices]
+        cluster_treatments = [treatments[idx] for idx in indices]
+        cluster_statuses = [statuses[idx] for idx in indices]
+        cluster_due_dates = [due_dates[idx] for idx in indices]
+        cluster_controls = [controls_list[idx] for idx in indices]
+        cluster_control_eff_text = [control_eff_texts[idx] for idx in indices]
+        cluster_control_eff_factor = [control_eff_factors[idx] for idx in indices if control_eff_factors[idx] is not None]
         cluster_acceptance = [acceptance_scores[idx] for idx in indices]
         cluster_parser_conf = [parser_confidences[idx] for idx in indices]
         cluster_div_conf = [division_confidences[idx] for idx in indices]
@@ -1133,14 +1081,12 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         ]
 
         avg_similarity = sum(similarities) / len(similarities) if similarities else 0
-        size_penalty = min(1.0, len(indices) / 5)
         acceptance_avg = sum(cluster_acceptance) / len(cluster_acceptance)
         parser_conf_avg = sum(cluster_parser_conf) / len(cluster_parser_conf)
         div_conf_avg = sum(cluster_div_conf) / len(cluster_div_conf)
 
         unique_divs = set(cluster_divisions)
         div_consistency = 1.0 if len(unique_divs) == 1 else 0.6 if len(unique_divs) <= 2 else 0.3
-
         unique_cats = set(cluster_categories)
         cat_consistency = 1.0 if len(unique_cats) == 1 else 0.7 if len(unique_cats) <= 2 else 0.4
 
@@ -1149,7 +1095,7 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
             (acceptance_avg / 10) * 0.20 +
             (parser_conf_avg) * 0.15 +
             (div_conf_avg) * 0.10 +
-            size_penalty * 0.10 +
+            (len(indices) / 5) * 0.10 +
             div_consistency * 0.10 +
             cat_consistency * 0.05
         ) * 100
@@ -1161,10 +1107,42 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         primary_division = div_counts.index[0] if not div_counts.empty else "Unknown Division"
         cat_counts = pd.Series(cluster_categories).value_counts()
         primary_category = cat_counts.index[0] if not cat_counts.empty else "Uncategorised"
-        max_residual = max(cluster_residuals)
+        max_residual = max(cluster_residuals) if cluster_residuals else 0
         avg_inherent = round(sum(cluster_inherents) / len(cluster_inherents), 1)
+        avg_impact = round(sum(cluster_impacts) / len(cluster_impacts), 1)
+        avg_likelihood = round(sum(cluster_likelihoods) / len(cluster_likelihoods), 1)
         all_owners = ", ".join(sorted(set(o for o in cluster_owners if o.lower() != "not assigned"))) or "Not assigned"
+        primary_owner = cluster_owners[0] if cluster_owners else "Not assigned"
         all_divisions_str = ", ".join(sorted(unique_divs))
+
+        # Controls aggregation
+        primary_controls = max([c for c in cluster_controls if c], key=len) if any(cluster_controls) else ""
+        all_controls = " | ".join(sorted(set(c for c in cluster_controls if c)))
+        avg_control_eff = round(sum(cluster_control_eff_factor) / len(cluster_control_eff_factor), 2) if cluster_control_eff_factor else None
+        worst_control_eff = max(cluster_control_eff_factor) if cluster_control_eff_factor else None
+        worst_control_text = cluster_control_eff_text[cluster_control_eff_factor.index(worst_control_eff)] if worst_control_eff in cluster_control_eff_factor else "Not rated"
+
+        # Mitigation strength
+        mitigation_strength = round((avg_inherent - max_residual) / avg_inherent * 100, 1) if avg_inherent > 0 else 0.0
+
+        # Treatment aggregation
+        strategy_counts = pd.Series([s for s in cluster_strategies if s]).value_counts()
+        primary_strategy = strategy_counts.index[0] if not strategy_counts.empty else "Treat"
+        all_strategies = ", ".join(sorted(set(s for s in cluster_strategies if s)))
+        primary_treatment = max([t for t in cluster_treatments if t], key=len) if any(cluster_treatments) else ""
+        all_treatments = " | ".join(sorted(set(t for t in cluster_treatments if t)))
+        valid_dates = [d for d in cluster_due_dates if d is not None]
+        earliest_due = min(valid_dates) if valid_dates else None
+        latest_due = max(valid_dates) if valid_dates else None
+        status_counts = pd.Series([s for s in cluster_statuses if s]).value_counts()
+        if "Overdue" in status_counts or "Delayed" in status_counts:
+            treatment_status = "Overdue"
+        elif "Completed" in status_counts or "Closed" in status_counts:
+            treatment_status = "Completed"
+        elif "On Track" in status_counts or "Active" in status_counts:
+            treatment_status = "On Track"
+        else:
+            treatment_status = "Mixed"
 
         enterprise_rows.append({
             "enterprise_risk_id": f"ER-{cluster_id+1:03d}",
@@ -1174,9 +1152,25 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
             "all_contributing_divisions": all_divisions_str,
             "primary_category": primary_category,
             "all_categories": ", ".join(sorted(unique_cats)),
-            "residual_score": max_residual,
             "inherent_score": avg_inherent,
-            "owners": all_owners,
+            "residual_score": max_residual,
+            "impact_pre": avg_impact,
+            "likelihood_pre": avg_likelihood,
+            "primary_owner": primary_owner,
+            "all_owners": all_owners,
+            "primary_strategy": primary_strategy,
+            "all_strategies": all_strategies,
+            "primary_treatment_plan": primary_treatment,
+            "all_treatment_plans": all_treatments,
+            "earliest_due_date": earliest_due,
+            "latest_due_date": latest_due,
+            "treatment_status": treatment_status,
+            "primary_controls": primary_controls,
+            "all_controls": all_controls,
+            "control_effectiveness": worst_control_text,
+            "control_effectiveness_factor": worst_control_eff,
+            "avg_control_effectiveness": avg_control_eff,
+            "mitigation_strength_pct": mitigation_strength,
             "cluster_size": len(indices),
             "cluster_confidence": cluster_confidence,
             "source_risks": cluster_names,
@@ -1191,9 +1185,8 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
             "primary_division": primary_division,
             "all_divisions": all_divisions_str,
             "primary_category": primary_category,
-            "categories": ", ".join(sorted(unique_cats)),
+            "mitigation_strength": mitigation_strength,
             "canonical_name": canonical_name,
-            "source_risks": cluster_names,
         })
 
     enterprise_df = pd.DataFrame(enterprise_rows)
@@ -1246,54 +1239,7 @@ def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[p
     return raw_df, enterprise_df, clusters_detail_df, all_debug
 
 # =============================================================================
-# AI FUNCTIONS
-# =============================================================================
-def ai_executive_briefing(snapshot: Dict, correlations: List[Dict], recommendations: Dict, company: str) -> str:
-    if not GEMINI_AVAILABLE:
-        return ""
-
-    context = f"""
-    Company: {company}
-    Health Score: {snapshot.get('enterprise_health_score', 0)}/100
-    Total Enterprise Risks: {snapshot.get('total_risks', 0)}
-    Critical+High: {snapshot.get('critical_count', 0) + snapshot.get('high_count', 0)}
-    Top Division: {snapshot.get('top_division', 'N/A')} ({snapshot.get('top_division_pct', 0)}% of exposure)
-    Appetite Breached: {snapshot.get('pct_breached', 0)}%
-    Treatment Confidence: {snapshot.get('treatment_confidence', 0)}%
-
-    Cross-Division Correlations Found: {len(correlations)}
-    """
-
-    if correlations:
-        context += "\nTop Correlated Risks Across Divisions:\n"
-        for corr in correlations[:3]:
-            context += f"- {corr['risk_a']['name']} ({corr['risk_a']['division']}) ↔ {corr['risk_b']['name']} ({corr['risk_b']['division']}) - {corr['similarity']}% similar\n"
-
-    if recommendations:
-        context += f"\nThreshold Recommendation: {recommendations.get('global', {}).get('recommended', 'N/A')} (current: {snapshot.get('threshold', 12)})\n"
-
-    prompt = f"""
-    You are a Chief Risk Officer writing a board‑level executive briefing.
-    Based on the data below, write a concise but insightful 4‑5 sentence briefing that:
-    - Highlights the most critical enterprise health indicators.
-    - Identifies cross‑divisional risk patterns and what they mean.
-    - Suggests 1‑2 actionable focus areas for the next quarter.
-    - Uses professional, confident language suitable for the board.
-
-    Data:
-    {context}
-
-    Briefing:
-    """
-
-    try:
-        response = ai_model.generate_content(prompt)
-        return response.text.strip()
-    except:
-        return ""
-
-# =============================================================================
-# INTELLIGENCE ENGINE (USES ENTERPRISE REGISTER)
+# INTELLIGENCE ENGINE
 # =============================================================================
 def appetite_band(score: float, threshold: int, category: str = "", category_appetite: Dict = None) -> str:
     if pd.isna(score):
@@ -1319,6 +1265,12 @@ def calculate_enterprise_health_score(df: pd.DataFrame) -> float:
     if "cluster_confidence" in df.columns:
         low_conf_pct = (df["cluster_confidence"] < 60).mean() * 100
         score -= low_conf_pct * 0.2
+    if "treatment_status" in df.columns:
+        overdue_pct = (df["treatment_status"] == "Overdue").mean() * 100
+        score -= overdue_pct * 0.5
+    if "avg_control_effectiveness" in df.columns:
+        weak_ctrl_pct = (df["avg_control_effectiveness"] < 0.3).mean() * 100
+        score -= weak_ctrl_pct * 0.4
     return max(0.0, round(score, 1))
 
 def detect_emerging_themes(df: pd.DataFrame) -> List[str]:
@@ -1339,84 +1291,6 @@ def detect_emerging_themes(df: pd.DataFrame) -> List[str]:
             themes.append(theme)
     return themes
 
-def find_cross_division_correlations(enterprise_df: pd.DataFrame, threshold: float = 0.75) -> List[Dict]:
-    if enterprise_df.empty or enterprise_df["primary_division"].nunique() < 2:
-        return []
-
-    correlations = []
-    statements = enterprise_df["risk_statement"].fillna("").tolist()
-    divisions = enterprise_df["primary_division"].tolist()
-    names = enterprise_df["risk_name"].tolist()
-
-    for i in range(len(statements)):
-        for j in range(i + 1, len(statements)):
-            if divisions[i] == divisions[j]:
-                continue
-
-            text_i = f"{names[i]} {statements[i]}"
-            text_j = f"{names[j]} {statements[j]}"
-
-            similarity = fuzz.ratio(text_i.lower(), text_j.lower()) / 100.0
-            if similarity >= threshold:
-                correlations.append({
-                    "risk_a": {"name": names[i], "division": divisions[i]},
-                    "risk_b": {"name": names[j], "division": divisions[j]},
-                    "similarity": round(similarity * 100, 1)
-                })
-
-    correlations.sort(key=lambda x: x["similarity"], reverse=True)
-    return correlations[:10]
-
-def recommend_appetite_thresholds(df: pd.DataFrame, current_threshold: int) -> Dict[str, Any]:
-    if df.empty:
-        return {}
-
-    recommendations = {}
-    overall_q75 = df["residual_score"].quantile(0.75)
-
-    recommendations["global"] = {
-        "current": current_threshold,
-        "recommended": int(min(25, max(6, round(overall_q75)))),
-        "reason": f"75th percentile of residual scores is {overall_q75:.1f}"
-    }
-
-    for category in df["primary_category"].unique():
-        cat_df = df[df["primary_category"] == category]
-        if len(cat_df) >= 3:
-            cat_q75 = cat_df["residual_score"].quantile(0.75)
-            recommendations[category] = {
-                "recommended": int(min(25, max(6, round(cat_q75)))),
-                "reason": f"75th percentile for {category} risks is {cat_q75:.1f}"
-            }
-
-    return recommendations
-
-def analyze_trends(current: Dict, previous: Dict) -> Dict[str, Any]:
-    if not previous:
-        return {}
-
-    trends = {}
-    health_delta = current.get("enterprise_health_score", 0) - previous.get("enterprise_health_score", 0)
-    trends["health_trend"] = "improving" if health_delta > 0 else "declining" if health_delta < 0 else "stable"
-    trends["health_delta"] = health_delta
-
-    breach_delta = current.get("pct_breached", 0) - previous.get("pct_breached", 0)
-    trends["breach_trend"] = "worsening" if breach_delta > 0 else "improving" if breach_delta < 0 else "stable"
-
-    prev_cat = previous.get("category_exposure", {})
-    curr_cat = current.get("category_exposure", {})
-    growth = {}
-    for cat, exp in curr_cat.items():
-        prev_exp = prev_cat.get(cat, 0)
-        if prev_exp > 0:
-            growth[cat] = (exp - prev_exp) / prev_exp * 100
-
-    if growth:
-        fastest = max(growth, key=growth.get)
-        trends["fastest_growing_category"] = {"category": fastest, "growth_pct": round(growth[fastest], 1)}
-
-    return trends
-
 def build_intelligence_snapshot(enterprise_df: pd.DataFrame, threshold: int, category_appetite: Dict = None) -> Dict[str, Any]:
     if enterprise_df.empty:
         return {}
@@ -1425,6 +1299,7 @@ def build_intelligence_snapshot(enterprise_df: pd.DataFrame, threshold: int, cat
     snapshot["high_count"] = int((enterprise_df["residual_level"] == "High").sum())
     snapshot["avg_residual"] = round(enterprise_df["residual_score"].mean(), 1)
     snapshot["avg_inherent"] = round(enterprise_df["inherent_score"].mean(), 1)
+    snapshot["avg_mitigation_strength"] = round(enterprise_df["mitigation_strength_pct"].mean(), 1)
     exposure_by_div = enterprise_df.groupby("primary_division")["residual_score"].sum().sort_values(ascending=False)
     if not exposure_by_div.empty:
         snapshot["top_division"] = exposure_by_div.index[0]
@@ -1444,79 +1319,68 @@ def build_intelligence_snapshot(enterprise_df: pd.DataFrame, threshold: int, cat
     snapshot["pct_breached"] = round((enterprise_df["appetite_band"].isin(["breached", "critical breach"])).mean() * 100, 1)
     snapshot["emerging_themes"] = detect_emerging_themes(enterprise_df)
     snapshot["enterprise_health_score"] = calculate_enterprise_health_score(enterprise_df)
-    snapshot["treatment_confidence"] = round(
-        (enterprise_df["owners"] != "Not assigned").mean() * 70 + 30
-    )
+
+    conf_score = 0.0
+    if "primary_owner" in enterprise_df.columns:
+        conf_score += (enterprise_df["primary_owner"] != "Not assigned").mean() * 30
+    if "treatment_status" in enterprise_df.columns:
+        conf_score += (enterprise_df["treatment_status"] == "On Track").mean() * 30
+        conf_score += (enterprise_df["treatment_status"] == "Completed").mean() * 20
+    if "earliest_due_date" in enterprise_df.columns:
+        today = date.today()
+        future_due = enterprise_df["earliest_due_date"].apply(lambda d: d > today if pd.notna(d) else False).mean()
+        conf_score += future_due * 20
+    if "avg_control_effectiveness" in enterprise_df.columns:
+        avg_ctrl = enterprise_df["avg_control_effectiveness"].mean()
+        if pd.notna(avg_ctrl):
+            conf_score += avg_ctrl * 30
+    snapshot["treatment_confidence"] = round(min(100, conf_score))
+
     snapshot["total_risks"] = len(enterprise_df)
     snapshot["board_risks"] = enterprise_df.nlargest(5, "residual_score")[
-        ["risk_name", "primary_division", "residual_score", "owners", "primary_category", "cluster_confidence"]
-    ].rename(columns={"primary_division": "division", "owners": "owner", "primary_category": "category"}).to_dict("records")
+        ["risk_name", "primary_division", "residual_score", "primary_owner", "primary_category",
+         "treatment_status", "earliest_due_date", "mitigation_strength_pct", "cluster_confidence"]
+    ].rename(columns={"primary_division": "division", "primary_owner": "owner", "primary_category": "category"}).to_dict("records")
     snapshot["threshold"] = threshold
     return snapshot
 
-def compare_snapshots(current: Dict, previous: Dict) -> Dict[str, Any]:
-    if not previous or not current:
-        return {}
-    current_risks = {r["risk_name"]: r for r in current.get("risks_list", [])}
-    previous_risks = {r["risk_name"]: r for r in previous.get("risks_list", [])}
-    return {
-        "new_risks": [current_risks[n] for n in current_risks if n not in previous_risks],
-        "closed_risks": [previous_risks[n] for n in previous_risks if n not in current_risks],
-        "worsened_risks": [{"name": n, "delta": current_risks[n]["residual_score"] - previous_risks[n]["residual_score"]}
-                           for n in current_risks if n in previous_risks and current_risks[n]["residual_score"] > previous_risks[n]["residual_score"] + 1],
-        "improved_risks": [{"name": n, "delta": current_risks[n]["residual_score"] - previous_risks[n]["residual_score"]}
-                           for n in current_risks if n in previous_risks and current_risks[n]["residual_score"] < previous_risks[n]["residual_score"] - 1],
-        "health_delta": current.get("enterprise_health_score", 0) - previous.get("enterprise_health_score", 0),
-        "appetite_delta": current.get("pct_breached", 0) - previous.get("pct_breached", 0),
-    }
-
-def generate_board_narrative(snapshot: Dict, comparison: Dict, threshold: int, company: str, report_title: str, ai_summary: str = "") -> str:
+def generate_board_narrative(snapshot: Dict, threshold: int, company: str, report_title: str) -> str:
     narrative = []
     narrative.append(f"# {report_title}")
     narrative.append(f"**Organization:** {company}")
     narrative.append(f"**Date:** {datetime.now().strftime('%B %d, %Y')}")
     narrative.append(f"**Reporting Period:** Q{((datetime.now().month-1)//3)+1} {datetime.now().year}")
     narrative.append("")
-    if ai_summary:
-        narrative.append(f"**AI Executive Summary:** {ai_summary}")
-        narrative.append("")
     health = snapshot.get("enterprise_health_score", 0)
     posture = "Strong" if health >= 80 else "Stable" if health >= 60 else "Elevated" if health >= 40 else "Critical"
     narrative.append(f"## 1. Executive Posture Summary")
     narrative.append(f"**Enterprise Health Score:** {health}/100 ({posture})")
     narrative.append(f"**Total Enterprise Risks:** {snapshot.get('critical_count', 0) + snapshot.get('high_count', 0)} critical/high, {snapshot.get('avg_residual', 0):.1f}/25 average residual")
+    narrative.append(f"**Average Mitigation Strength:** {snapshot.get('avg_mitigation_strength', 0)}%")
     narrative.append("")
-    if comparison:
-        narrative.append(f"## 2. Movement Since Last Review")
-        if comparison.get("new_risks"):
-            narrative.append(f"- **New risks:** {len(comparison['new_risks'])}")
-        if comparison.get("closed_risks"):
-            narrative.append(f"- **Closed risks:** {len(comparison['closed_risks'])}")
-        if comparison.get("worsened_risks"):
-            narrative.append(f"- **Worsened risks:** {len(comparison['worsened_risks'])}")
-        if comparison.get("improved_risks"):
-            narrative.append(f"- **Improved risks:** {len(comparison['improved_risks'])}")
-        narrative.append("")
-    narrative.append(f"## 3. Concentration Risk Areas")
+    narrative.append(f"## 2. Concentration Risk Areas")
     narrative.append(f"**Top Division Exposure:** {snapshot.get('top_division', 'N/A')} ({snapshot.get('top_division_pct', 0)}% of enterprise load)")
     narrative.append("")
-    narrative.append(f"## 4. Risk Appetite Status (Threshold: {threshold}/25)")
+    narrative.append(f"## 3. Risk Appetite Status (Threshold: {threshold}/25)")
     narrative.append(f"- Within appetite: {snapshot.get('pct_within_appetite', 0)}%")
     narrative.append(f"- Near appetite: {snapshot.get('pct_near_appetite', 0)}%")
     narrative.append(f"- Breached: {snapshot.get('pct_breached', 0)}%")
     narrative.append("")
-    narrative.append(f"## 5. Treatment Delivery Confidence")
+    narrative.append(f"## 4. Treatment Delivery Confidence")
     narrative.append(f"**Confidence Score:** {snapshot.get('treatment_confidence', 0)}%")
     narrative.append("")
     if snapshot.get("board_risks"):
-        narrative.append(f"## 6. Top 5 Board-Attention Risks")
+        narrative.append(f"## 5. Top 5 Board-Attention Risks")
         for risk in snapshot["board_risks"]:
             conf_str = f" (Confidence: {risk.get('cluster_confidence', 'N/A')}%)" if 'cluster_confidence' in risk else ""
-            narrative.append(f"- **{risk['risk_name']}** ({risk['division']}) – Residual: {risk['residual_score']}/25, Owner: {risk['owner']}{conf_str}")
+            due_str = f" Due: {risk.get('earliest_due_date', 'N/A')}" if risk.get('earliest_due_date') else ""
+            status_str = f" Status: {risk.get('treatment_status', 'N/A')}"
+            mitigation_str = f" Mitigation: {risk.get('mitigation_strength_pct', 0)}%"
+            narrative.append(f"- **{risk['risk_name']}** ({risk['division']}) – Residual: {risk['residual_score']}/25, Owner: {risk['owner']}{due_str}{status_str}{mitigation_str}{conf_str}")
         narrative.append("")
     themes = snapshot.get("emerging_themes", [])
     if themes:
-        narrative.append(f"## 7. Emerging Systemic Themes")
+        narrative.append(f"## 6. Emerging Systemic Themes")
         for theme in themes:
             narrative.append(f"- {theme}")
         narrative.append("")
@@ -1547,18 +1411,18 @@ def style_excel_with_risk_colors(wb):
                 for col in range(1, ws.max_column + 1):
                     ws.cell(row=row, column=col).fill = fill
 
-def generate_intelligent_excel_pack(data: Dict[str, Any], narrative: str, correlations: List[Dict], trends: Dict) -> io.BytesIO:
+def generate_intelligent_excel_pack(data: Dict[str, Any], narrative: str) -> io.BytesIO:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         summary = pd.DataFrame({
-            "Metric": ["Organization", "Report Title", "Period", "Board Date", "Health Score", "Total Enterprise Risks", "Critical+High", "Avg Residual", "Top Division", "Treatment Confidence", "Within Appetite", "Near Appetite", "Breached"],
+            "Metric": ["Organization", "Report Title", "Period", "Board Date", "Health Score", "Total Enterprise Risks", "Critical+High", "Avg Residual", "Top Division", "Treatment Confidence", "Avg Mitigation Strength", "Within Appetite", "Near Appetite", "Breached"],
             "Value": [
                 data.get("company", ""), data.get("report_title", ""), data.get("period", ""), data.get("board_date", ""),
                 data.get("enterprise_health_score", 0), data["total_risks"],
                 data.get("critical_count", 0) + data.get("high_count", 0),
                 f"{data.get('avg_residual', 0):.1f}/25", f"{data.get('top_division', 'N/A')} ({data.get('top_division_pct', 0)}%)",
-                f"{data.get('treatment_confidence', 0)}%", f"{data.get('pct_within_appetite', 0)}%",
-                f"{data.get('pct_near_appetite', 0)}%", f"{data.get('pct_breached', 0)}%"
+                f"{data.get('treatment_confidence', 0)}%", f"{data.get('avg_mitigation_strength', 0)}%",
+                f"{data.get('pct_within_appetite', 0)}%", f"{data.get('pct_near_appetite', 0)}%", f"{data.get('pct_breached', 0)}%"
             ]
         })
         summary.to_excel(writer, sheet_name="Executive Summary", index=False)
@@ -1579,21 +1443,6 @@ def generate_intelligent_excel_pack(data: Dict[str, Any], narrative: str, correl
         if st.session_state.parser_audit:
             audit_df = pd.DataFrame([st.session_state.parser_audit])
             audit_df.to_excel(writer, sheet_name="Parser Audit", index=False)
-        if correlations:
-            corr_df = pd.DataFrame([{
-                "Risk A Name": c["risk_a"]["name"],
-                "Risk A Division": c["risk_a"]["division"],
-                "Risk B Name": c["risk_b"]["name"],
-                "Risk B Division": c["risk_b"]["division"],
-                "Similarity %": c["similarity"]
-            } for c in correlations])
-            corr_df.to_excel(writer, sheet_name="Cross-Division Correlations", index=False)
-        if trends:
-            trends_df = pd.DataFrame([trends])
-            trends_df.to_excel(writer, sheet_name="Trend Analysis", index=False)
-        briefing_df = pd.DataFrame({"Executive Briefing": [data.get("ai_summary", "")]})
-        briefing_df.to_excel(writer, sheet_name="AI Executive Briefing", index=False)
-
     output.seek(0)
     wb = load_workbook(output)
     style_excel_with_risk_colors(wb)
@@ -1628,7 +1477,7 @@ def generate_pdf_board_pack(narrative: str, snapshot: Dict, company: str, report
             story.append(Spacer(1, 6))
     if snapshot.get("board_risks"):
         story.append(Spacer(1, 12))
-        story.append(Paragraph("Top Board-Attention Risks (Color Coded)", heading_style))
+        story.append(Paragraph("Top Board-Attention Risks", heading_style))
         data = []
         for risk in snapshot["board_risks"][:5]:
             level = "Critical" if risk["residual_score"] >= 20 else "High" if risk["residual_score"] >= 12 else "Medium" if risk["residual_score"] >= 6 else "Low"
@@ -1659,7 +1508,7 @@ def generate_pdf_board_pack(narrative: str, snapshot: Dict, company: str, report
     return buffer.getvalue()
 
 # =============================================================================
-# DASHBOARD CHARTS (USING ENTERPRISE REGISTER)
+# DASHBOARD CHARTS
 # =============================================================================
 def create_category_chart(df: pd.DataFrame) -> go.Figure:
     if df.empty:
@@ -1748,10 +1597,6 @@ def apply_custom_theme(primary: str, secondary: str) -> None:
         border-radius: 28px; padding: 28px 32px; color: white; margin-bottom: 24px;
         box-shadow: 0 12px 32px rgba(14, 54, 92, 0.2);
     }}
-    .exec-ai-brief {{
-        background: #f1f5f9; border-radius: 18px; padding: 20px 24px;
-        border-left: 8px solid {primary}; margin-bottom: 24px;
-    }}
     .kpi-card {{
         background: white; border-radius: 16px; padding: 18px 16px;
         box-shadow: 0 4px 12px rgba(0,0,0,0.04); border: 1px solid #edf2f7; height: 100%;
@@ -1771,6 +1616,8 @@ def apply_custom_theme(primary: str, secondary: str) -> None:
     .confidence-high {{ background-color: #dcfce7; color: #166534; }}
     .confidence-medium {{ background-color: #fef9c3; color: #854d0e; }}
     .confidence-low {{ background-color: #fee2e2; color: #991b1b; }}
+    .status-ontrack {{ background-color: #dcfce7; color: #166534; }}
+    .status-overdue {{ background-color: #fee2e2; color: #991b1b; }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -1802,7 +1649,6 @@ def render_sidebar():
             st.markdown("""
 **Professional** – $29/month or $99/year  
 - Full board pack  
-- AI briefing  
 - Heatmaps  
 - Category/Division charts  
 """)
@@ -1924,8 +1770,6 @@ def render_sidebar():
         st.session_state.primary_color = st.color_picker("Primary Color", st.session_state.primary_color)
         st.session_state.secondary_color = st.color_picker("Secondary Color", st.session_state.secondary_color)
         st.checkbox("🔧 Debug Mode", key="debug_mode")
-        if GEMINI_AVAILABLE:
-            st.checkbox("🤖 Force Gemini Extraction", key="force_gemini", value=True)
 
 # =============================================================================
 # MAIN APP
@@ -1933,11 +1777,6 @@ def render_sidebar():
 def main():
     apply_custom_theme(st.session_state.primary_color, st.session_state.secondary_color)
     render_sidebar()
-
-    if GEMINI_AVAILABLE:
-        st.success("✅ Gemini API is configured and ready")
-    else:
-        st.error("❌ Gemini API key not found")
 
     if st.session_state.tier == "free":
         st.info("🔓 Free tier: 1 file, preview only. Upgrade for full features.")
@@ -1965,7 +1804,6 @@ def main():
                             st.markdown(f"**File {i+1}**")
                             st.json(debug)
                 else:
-                    # Safety gate: warn if all divisions are Unknown Division
                     if (enterprise_df["primary_division"] == "Unknown Division").all():
                         st.warning("⚠️ Division detection failed. Enterprise intelligence may be unreliable until lineage is restored.")
                     st.success(f"✅ {len(enterprise_df)} enterprise risks consolidated from {len(raw_df)} raw accepted risks")
@@ -1975,20 +1813,8 @@ def main():
 
                     category_appetite = st.session_state.category_appetite if st.session_state.tier == "enterprise" else None
                     snapshot = build_intelligence_snapshot(enterprise_df, st.session_state.board_threshold, category_appetite)
-                    comparison = {}
-                    trends = {}
-                    if st.session_state.history:
-                        comparison = compare_snapshots(snapshot, st.session_state.history[-1])
-                        trends = analyze_trends(snapshot, st.session_state.history[-1])
+                    narrative = generate_board_narrative(snapshot, st.session_state.board_threshold, st.session_state.org_name, st.session_state.report_title)
 
-                    correlations = find_cross_division_correlations(enterprise_df)
-                    recommendations = recommend_appetite_thresholds(enterprise_df, st.session_state.board_threshold)
-
-                    ai_summary = ""
-                    if st.session_state.tier != "free" and GEMINI_AVAILABLE:
-                        ai_summary = ai_executive_briefing(snapshot, correlations, recommendations, st.session_state.org_name)
-
-                    narrative = generate_board_narrative(snapshot, comparison, st.session_state.board_threshold, st.session_state.org_name, st.session_state.report_title, ai_summary)
                     st.session_state.rf_data = {
                         "raw_df": raw_df,
                         "enterprise_df": enterprise_df,
@@ -2003,6 +1829,7 @@ def main():
                         "high_count": snapshot.get("high_count", 0),
                         "avg_residual": snapshot.get("avg_residual", 0),
                         "avg_inherent": snapshot.get("avg_inherent", 0),
+                        "avg_mitigation_strength": snapshot.get("avg_mitigation_strength", 0),
                         "enterprise_health_score": snapshot.get("enterprise_health_score", 0),
                         "treatment_confidence": snapshot.get("treatment_confidence", 0),
                         "top_division": snapshot.get("top_division", "N/A"),
@@ -2015,17 +1842,9 @@ def main():
                         "emerging_themes": snapshot.get("emerging_themes", []),
                         "board_risks": snapshot.get("board_risks", []),
                         "narrative": narrative,
-                        "comparison": comparison,
-                        "trends": trends,
-                        "correlations": correlations,
-                        "recommendations": recommendations,
-                        "ai_summary": ai_summary
                     }
-                    st.session_state.history.append(snapshot)
-                    if len(st.session_state.history) > 4:
-                        st.session_state.history = st.session_state.history[-4:]
                     if st.session_state.tier != "free":
-                        excel_data = generate_intelligent_excel_pack(st.session_state.rf_data, narrative, correlations, trends)
+                        excel_data = generate_intelligent_excel_pack(st.session_state.rf_data, narrative)
                         st.download_button("📥 Excel Board Pack", excel_data, file_name=f"RiskForge_{datetime.now().strftime('%Y%m%d')}.xlsx")
                         if st.session_state.tier == "enterprise":
                             pdf_data = generate_pdf_board_pack(narrative, snapshot, st.session_state.org_name, st.session_state.report_title, st.session_state.logo_bytes)
@@ -2034,7 +1853,6 @@ def main():
                         st.info("📌 Upgrade to Professional/Enterprise to download board packs.")
                     st.rerun()
 
-    # Hero header
     if st.session_state.rf_data:
         health = st.session_state.rf_data.get("enterprise_health_score", 0)
     else:
@@ -2088,7 +1906,7 @@ def main():
         enterprise_df = data["enterprise_df"]
         raw_df = data["raw_df"]
         clusters_detail_df = data.get("clusters_detail_df", pd.DataFrame())
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 Dashboard", "📑 Register", "🧠 Intelligence", "📈 Trends", "🔍 Review Queue", "📤 Export"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "📑 Register", "📈 Intelligence", "🔍 Review Queue", "📤 Export"])
 
         with tab1:
             st.subheader("Executive Dashboard")
@@ -2128,9 +1946,8 @@ def main():
             with col5:
                 st.markdown(f"""
                 <div class="kpi-card">
-                    <div class="kpi-label">🏢 Top Division</div>
-                    <div class="kpi-value" style="font-size: 1.3rem;">{data['top_division']}</div>
-                    <div style="color: #64748b; font-size: 0.8rem;">{data['top_division_pct']}% of load</div>
+                    <div class="kpi-label">🛡️ Avg Mitigation</div>
+                    <div class="kpi-value">{data.get('avg_mitigation_strength', 0)}%</div>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -2159,7 +1976,10 @@ def main():
             st.subheader("Enterprise Risk Register")
             display_df = enterprise_df[[
                 "enterprise_risk_id", "risk_name", "risk_statement", "primary_division", "all_contributing_divisions",
-                "primary_category", "residual_score", "inherent_score", "owners", "cluster_size", "cluster_confidence"
+                "primary_category", "inherent_score", "residual_score", "impact_pre", "likelihood_pre",
+                "primary_owner", "all_owners", "primary_strategy", "primary_treatment_plan",
+                "earliest_due_date", "treatment_status", "primary_controls", "control_effectiveness",
+                "mitigation_strength_pct", "cluster_size", "cluster_confidence"
             ]].rename(columns={
                 "enterprise_risk_id": "Risk ID",
                 "risk_name": "Risk Name",
@@ -2167,9 +1987,19 @@ def main():
                 "primary_division": "Primary Division",
                 "all_contributing_divisions": "Contributing Divisions",
                 "primary_category": "Category",
-                "residual_score": "Residual",
                 "inherent_score": "Inherent",
-                "owners": "Owners",
+                "residual_score": "Residual",
+                "impact_pre": "Impact",
+                "likelihood_pre": "Likelihood",
+                "primary_owner": "Primary Owner",
+                "all_owners": "All Owners",
+                "primary_strategy": "Strategy",
+                "primary_treatment_plan": "Treatment Plan",
+                "earliest_due_date": "Due Date",
+                "treatment_status": "Status",
+                "primary_controls": "Controls",
+                "control_effectiveness": "Control Eff.",
+                "mitigation_strength_pct": "Mitigation %",
                 "cluster_size": "Sources",
                 "cluster_confidence": "Confidence"
             })
@@ -2204,6 +2034,14 @@ def main():
                             cell_style = "background-color: #fef9c3; color: #854d0e; font-weight: 600;"
                         else:
                             cell_style = "background-color: #fee2e2; color: #991b1b; font-weight: 600;"
+                    elif col_name == "Status":
+                        status_str = str(value).lower()
+                        if "overdue" in status_str or "delayed" in status_str:
+                            cell_style = "background-color: #fee2e2; color: #991b1b; font-weight: 600;"
+                        elif "completed" in status_str or "closed" in status_str:
+                            cell_style = "background-color: #dcfce7; color: #166534; font-weight: 600;"
+                        elif "on track" in status_str or "active" in status_str:
+                            cell_style = "background-color: #fef9c3; color: #854d0e; font-weight: 600;"
                     elif col_name in ["Inherent", "Residual"]:
                         try:
                             score = float(value)
@@ -2217,6 +2055,17 @@ def main():
                                 cell_style = "background-color: #dcfce7; color: #166534; font-weight: 600;"
                         except:
                             pass
+                    elif col_name == "Mitigation %":
+                        try:
+                            mit = float(value)
+                            if mit >= 50:
+                                cell_style = "background-color: #dcfce7; color: #166534; font-weight: 600;"
+                            elif mit >= 25:
+                                cell_style = "background-color: #fef9c3; color: #854d0e; font-weight: 600;"
+                            else:
+                                cell_style = "background-color: #fee2e2; color: #991b1b; font-weight: 600;"
+                        except:
+                            pass
                     display_val = str(value) if pd.notna(value) else ""
                     html_table += f'<td style="{cell_style}">{display_val}</td>'
                 html_table += '</tr>'
@@ -2226,165 +2075,14 @@ def main():
             with st.expander("📋 Raw Accepted Risks (Source Data)"):
                 st.dataframe(raw_df, use_container_width=True)
 
-            with st.expander("🔗 Full Lineage (Click to expand)"):
-                for _, row in enterprise_df.head(10).iterrows():
-                    st.markdown(f"**{row['risk_name']}** (Confidence: {row['cluster_confidence']}%)")
-                    st.caption(f"Source: {row['source_lineage']}")
-                    st.divider()
-
         with tab3:
-            if data.get("ai_summary"):
-                st.markdown(f"""
-                <div class="exec-ai-brief">
-                    <div style="display: flex; align-items: center; margin-bottom: 12px;">
-                        <span style="font-size: 20px; margin-right: 10px;">🤖</span>
-                        <span style="font-weight: 700; font-size: 18px; color: #0E365C;">AI Executive Briefing</span>
-                    </div>
-                    <div style="font-size: 16px; color: #1e293b; line-height: 1.6;">
-                        {data['ai_summary']}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            col_left, col_right = st.columns([1.4, 1])
-            with col_left:
-                st.markdown(f"""
-                <div class="exec-card">
-                    <div class="exec-card-header">
-                        <span class="exec-card-title">📋 Executive Posture</span>
-                    </div>
-                    <div class="exec-metric-row">
-                        <span class="exec-metric-label">Enterprise Risks</span>
-                        <span class="exec-metric-value">{data['total_risks']}</span>
-                    </div>
-                    <div class="exec-metric-row">
-                        <span class="exec-metric-label">Critical + High</span>
-                        <span class="exec-metric-value">{data['critical_count'] + data['high_count']}</span>
-                    </div>
-                    <div class="exec-metric-row">
-                        <span class="exec-metric-label">Avg Residual</span>
-                        <span class="exec-metric-value">{data.get('avg_residual', 0):.1f} / 25</span>
-                    </div>
-                    <div class="exec-divider"></div>
-                    <div class="exec-metric-row">
-                        <span class="exec-metric-label">Treatment Confidence</span>
-                        <span class="exec-metric-value">{data.get('treatment_confidence', 0)}%</span>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                comp = data.get("comparison", {})
-                if comp:
-                    movement_html = ""
-                    if comp.get("new_risks"):
-                        movement_html += f"""<div class="exec-metric-row"><span class="exec-metric-label">🆕 New Risks</span><span class="exec-metric-value">{len(comp['new_risks'])}</span></div>"""
-                    if comp.get("closed_risks"):
-                        movement_html += f"""<div class="exec-metric-row"><span class="exec-metric-label">✅ Closed Risks</span><span class="exec-metric-value">{len(comp['closed_risks'])}</span></div>"""
-                    if movement_html:
-                        st.markdown(f"""<div class="exec-card"><div class="exec-card-header"><span class="exec-card-title">📊 Movement</span></div>{movement_html}</div>""", unsafe_allow_html=True)
-
-                st.markdown(f"""
-                <div class="exec-card">
-                    <div class="exec-card-header"><span class="exec-card-title">🎯 Concentration</span></div>
-                    <div class="exec-metric-row"><span class="exec-metric-label">Top Division</span><span class="exec-metric-value">{data.get('top_division', 'N/A')} ({data.get('top_division_pct', 0)}%)</span></div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            with col_right:
-                within = data.get('pct_within_appetite', 0)
-                near = data.get('pct_near_appetite', 0)
-                breached = data.get('pct_breached', 0)
-                st.markdown(f"""
-                <div class="exec-card">
-                    <div class="exec-card-header"><span class="exec-card-title">⚖️ Appetite Status</span></div>
-                    <div style="margin-bottom:16px;">
-                        <div style="display:flex;align-items:center;margin-bottom:10px;"><div style="width:12px;height:12px;border-radius:4px;background:#10b981;margin-right:10px;"></div><span class="exec-metric-label" style="flex:1;">Within</span><span class="exec-metric-value">{within}%</span></div>
-                        <div style="display:flex;align-items:center;margin-bottom:10px;"><div style="width:12px;height:12px;border-radius:4px;background:#f59e0b;margin-right:10px;"></div><span class="exec-metric-label" style="flex:1;">Near</span><span class="exec-metric-value">{near}%</span></div>
-                        <div style="display:flex;align-items:center;"><div style="width:12px;height:12px;border-radius:4px;background:#ef4444;margin-right:10px;"></div><span class="exec-metric-label" style="flex:1;">Breached</span><span class="exec-metric-value">{breached}%</span></div>
-                    </div>
-                    <div class="exec-divider"></div>
-                    <div class="exec-metric-row"><span class="exec-metric-label">Threshold</span><span class="exec-metric-value">{data.get('threshold', 12)}/25</span></div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                themes = data.get('emerging_themes', [])
-                if themes:
-                    themes_html = "".join([f'<span class="exec-badge" style="background:#e0e7ff;color:#3730a3;margin-right:8px;">{theme}</span>' for theme in themes])
-                    st.markdown(f"""<div class="exec-card"><div class="exec-card-header"><span class="exec-card-title">🔍 Themes</span></div>{themes_html}</div>""", unsafe_allow_html=True)
-
-            correlations = data.get("correlations", [])
-            if correlations:
-                with st.expander("🔗 Cross‑Division Correlations", expanded=True):
-                    for corr in correlations[:5]:
-                        st.markdown(f"""
-                        <div style="background:#f1f5f9;border-radius:12px;padding:12px;margin-bottom:8px;">
-                            <div style="display:flex;align-items:center;gap:12px;">
-                                <div style="flex:1;"><b>{corr['risk_a']['name']}</b><br><small>{corr['risk_a']['division']}</small></div>
-                                <div style="background:#0E365C;color:white;padding:4px 12px;border-radius:20px;">{corr['similarity']}%</div>
-                                <div style="flex:1;"><b>{corr['risk_b']['name']}</b><br><small>{corr['risk_b']['division']}</small></div>
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-            recommendations = data.get("recommendations", {})
-            if recommendations:
-                with st.expander("🎯 Threshold Recommendations", expanded=False):
-                    rec = recommendations.get("global", {})
-                    st.markdown(f"**Recommended:** {rec.get('recommended', 'N/A')} (current: {data['threshold']})")
-
-            board_risks = data.get('board_risks', [])
-            if board_risks:
-                st.markdown("""<div style="margin-top:24px;"><div class="exec-card-header"><span class="exec-card-title" style="font-size:1.4rem;">⚠️ Top 5 Board Risks</span></div></div>""", unsafe_allow_html=True)
-                for risk in board_risks[:5]:
-                    score = risk['residual_score']
-                    if score >= 20:
-                        border_color, score_bg, score_color, level = "#dc2626", "#fee2e2", "#991b1b", "Critical"
-                    elif score >= 12:
-                        border_color, score_bg, score_color, level = "#ea580c", "#ffedd5", "#9a3412", "High"
-                    elif score >= 6:
-                        border_color, score_bg, score_color, level = "#ca8a04", "#fef9c3", "#854d0e", "Medium"
-                    else:
-                        border_color, score_bg, score_color, level = "#16a34a", "#dcfce7", "#166534", "Low"
-                    conf = risk.get('cluster_confidence', 'N/A')
-                    st.markdown(f"""
-                    <div class="exec-risk-card" style="border-left-color:{border_color};">
-                        <div style="display:flex;justify-content:space-between;">
-                            <div>
-                                <div style="font-size:18px;font-weight:700;color:#0E365C;">{risk['risk_name']}</div>
-                                <div style="font-size:14px;color:#475569;">{risk['division']} • {risk['owner']} • {risk['category']}</div>
-                                <div style="font-size:12px;color:#64748b;">Confidence: {conf}%</div>
-                            </div>
-                            <div style="background:{score_bg};color:{score_color};padding:8px 16px;border-radius:20px;font-weight:800;">{score}/25</div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-            with st.expander("📄 Full Narrative"):
-                st.markdown(data.get("narrative", "No narrative"))
+            st.markdown(data.get("narrative", "No narrative available"))
+            if data.get("board_risks"):
+                st.markdown("### Top 5 Board-Attention Risks")
+                for risk in data["board_risks"]:
+                    st.markdown(f"- **{risk['risk_name']}** ({risk['division']}) – Residual: {risk['residual_score']}/25, Owner: {risk['owner']}, Mitigation: {risk.get('mitigation_strength_pct', 0)}%")
 
         with tab4:
-            st.subheader("Quarter Comparison & Trends")
-            if data.get("comparison"):
-                comp = data["comparison"]
-                if comp.get("new_risks"):
-                    st.markdown(f"**🆕 New Risks:** {len(comp['new_risks'])}")
-                if comp.get("closed_risks"):
-                    st.markdown(f"**✅ Closed Risks:** {len(comp['closed_risks'])}")
-                if comp.get("health_delta", 0) != 0:
-                    direction = "improved" if comp["health_delta"] > 0 else "declined"
-                    st.markdown(f"**Health Change:** {comp['health_delta']:+.1f} pts ({direction})")
-            else:
-                st.info("Upload another register next quarter to see trends.")
-            trends = data.get("trends", {})
-            if trends:
-                with st.expander("📈 Advanced Trends", expanded=False):
-                    if trends.get("health_trend"):
-                        st.markdown(f"**Health Trend:** {trends['health_trend']}")
-                    if trends.get("fastest_growing_category"):
-                        fgc = trends["fastest_growing_category"]
-                        st.markdown(f"**Fastest Growing Category:** {fgc['category']} (+{fgc['growth_pct']}%)")
-
-        with tab5:
             st.subheader("🔍 Review Queue – Low Confidence & Rejected Items")
             if not clusters_detail_df.empty:
                 low_conf = clusters_detail_df[clusters_detail_df["cluster_confidence"] < 60]
@@ -2405,7 +2103,7 @@ def main():
                 else:
                     st.success("All accepted rows have good evidence scores.")
 
-        with tab6:
+        with tab5:
             st.subheader("Export Options")
             if st.session_state.tier != "free":
                 st.success("✅ Full export available above.")
