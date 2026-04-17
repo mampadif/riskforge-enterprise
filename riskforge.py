@@ -203,7 +203,6 @@ def clean_division_value(val: Any) -> str:
     if not text:
         return ""
 
-    # Reject year-like values immediately
     if is_year_like(text):
         return ""
 
@@ -237,26 +236,29 @@ def looks_like_category(text: str) -> bool:
     }
     return normalize_text(text).lower() in categories
 
-def infer_division_from_filename(file_name: str) -> str:
-    """Extract division from filename keywords."""
-    name = file_name.lower()
-    if "hr" in name or "human" in name:
-        return "Human Resources"
-    if "ist" in name:
-        return "Information Systems and Technology"
-    if "it" in name or "information technology" in name:
-        return "Information Technology"
-    if "nano" in name:
-        return "Nanomaterials"
-    if "mobility" in name:
-        return "eMobility"
-    if "finance" in name:
-        return "Finance"
-    if "legal" in name:
-        return "Legal"
-    return ""
+def infer_division_from_filename(file_name: str) -> Dict[str, Any]:
+    """Extract division from filename with confidence and source."""
+    if not file_name:
+        return {"division": "Unknown Division", "confidence": 0.0, "source": "filename"}
 
-def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: int = 12) -> Optional[str]:
+    name = file_name.lower()
+    patterns = {
+        "Human Resources": [r"\bhr\b", r"human resources?"],
+        "Information Systems and Technology": [r"\bist\b", r"information systems? and technology"],
+        "Information Technology": [r"\bit\b", r"\bict\b", r"information technology"],
+        "Nanomaterials": [r"\bnano\b", r"nanomaterials?"],
+        "eMobility": [r"emobility", r"e-mobility", r"\bmobility\b"],
+        "Finance": [r"\bfinance\b", r"financial"],
+        "Legal": [r"\blegal\b"],
+    }
+
+    for division, pats in patterns.items():
+        if any(re.search(p, name) for p in pats):
+            return {"division": division, "confidence": 0.85, "source": "filename"}
+
+    return {"division": "Unknown Division", "confidence": 0.0, "source": "filename"}
+
+def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: int = 12) -> Optional[Dict[str, Any]]:
     label_regex = re.compile(
         r"^(division\/dept|division|department|dept|directorate|function|unit|business unit)\s*[:\-]?$",
         re.I
@@ -293,28 +295,24 @@ def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: in
                     ]
                     if any(term in cand_text.lower() for term in reject_terms):
                         continue
-                    return cand_text
+                    return {"division": cand_text, "confidence": 0.95, "source": "explicit_cell"}
     return None
 
-def get_division_for_risk(file_name: str, sheet_name: str, explicit_division: Optional[str]) -> str:
-    """Hierarchical division detection."""
-    # 1. Explicit division from cell
-    if explicit_division:
-        return explicit_division
+def get_division_for_risk(file_name: str, sheet_name: str, explicit: Optional[Dict[str, Any]]) -> Tuple[str, str, float]:
+    """Return (division, source, confidence)."""
+    if explicit:
+        return explicit["division"], explicit["source"], explicit["confidence"]
 
-    # 2. Filename inference
     inferred = infer_division_from_filename(file_name)
-    if inferred:
-        return inferred
+    if inferred["confidence"] > 0:
+        return inferred["division"], inferred["source"], inferred["confidence"]
 
-    # 3. Sheet name inference (cleaned)
     clean_sheet = re.sub(r"(?i)\brisk\s*register\b", "", sheet_name).strip()
     clean_sheet = re.sub(r"[_\-\s]+", " ", clean_sheet).strip()
     if clean_sheet and not is_year_like(clean_sheet) and len(clean_sheet) >= 2:
-        return clean_sheet.title()
+        return clean_sheet.title(), "sheet_name", 0.60
 
-    # 4. Fallback
-    return "Unknown Division"
+    return "Unknown Division", "fallback", 0.0
 
 # =============================================================================
 # VALID CATEGORIES AND NORMALIZATION
@@ -364,12 +362,10 @@ def normalize_category_value(val: str) -> str:
     return ""
 
 def infer_category_from_text(title: str, statement: str, cause: str, raw_category: str = "") -> str:
-    # First, try to use validated raw category
     normalized_raw = normalize_category_value(raw_category)
     if normalized_raw:
         return normalized_raw
 
-    # Otherwise infer from text
     combined = " ".join([normalize_text(title), normalize_text(statement), normalize_text(cause)]).lower()
 
     if any(term in combined for term in ["compliance", "regulation", "labour law", "employment act", "legal"]):
@@ -491,7 +487,6 @@ def is_valid_risk_record(row: Dict[str, Any]) -> Tuple[bool, int, str]:
     evidence = 0
     reasons = []
 
-    # Require both risk_name and risk_statement
     if row.get("risk_name") and len(row["risk_name"]) > 3:
         evidence += 3
         reasons.append("has_risk_name")
@@ -506,7 +501,6 @@ def is_valid_risk_record(row: Dict[str, Any]) -> Tuple[bool, int, str]:
         reasons.append("missing_or_short_statement")
         return False, evidence, " | ".join(reasons)
 
-    # Additional evidence
     if row.get("cause"):
         evidence += 1
         reasons.append("has_cause")
@@ -534,7 +528,6 @@ def is_valid_risk_record(row: Dict[str, Any]) -> Tuple[bool, int, str]:
     return is_valid, evidence, reason_str
 
 def looks_like_continuation_fragment(text: str) -> bool:
-    """Detect numbered list items or lowercase-starting fragments."""
     if not text:
         return False
     t = text.strip()
@@ -542,13 +535,11 @@ def looks_like_continuation_fragment(text: str) -> bool:
         return True
     if t.startswith("- ") or t.startswith("• "):
         return True
-    # Lowercase start (likely continuation of previous sentence)
     if t and t[0].islower():
         return True
     return False
 
 def merge_continuation_rows(rows: List[Dict]) -> List[Dict]:
-    """Merge rows that are continuations (no risk_name/statement) into previous risk."""
     merged = []
     current = None
     for row in rows:
@@ -588,7 +579,6 @@ def compute_scores(
     control_eff_numeric = parse_control_effectiveness(raw_control_effectiveness)
     control_eff_text = normalize_text(raw_control_effectiveness) or "Not rated"
 
-    # Inherent
     if inherent_score is not None and inherent_score > 5:
         inherent = float(inherent_score)
     elif impact_score is not None and likelihood_score is not None:
@@ -602,7 +592,6 @@ def compute_scores(
 
     inherent = min(25, max(1, round(inherent)))
 
-    # Residual
     if residual_score is not None and residual_score > 5:
         residual = float(residual_score)
     elif control_eff_numeric is not None:
@@ -681,8 +670,8 @@ def parse_structured_sheet(
     raw_rows: List[Dict[str, Any]] = []
     row_audit: List[Dict[str, Any]] = []
 
-    explicit_division = detect_explicit_division(ws, header_row=header_row)
-    division_name = get_division_for_risk(file_name, sheet_name, explicit_division)
+    explicit = detect_explicit_division(ws, header_row=header_row)
+    division_name, division_source, division_conf = get_division_for_risk(file_name, sheet_name, explicit)
 
     def get_field(row_idx: int, field_name: str) -> Any:
         col_idx = col_map.get(field_name)
@@ -725,7 +714,6 @@ def parse_structured_sheet(
         status = normalize_text(raw_status) or "Active"
         due_date_raw = normalize_text(raw_due_date)
 
-        # Skip empty rows
         combined_gate = " ".join([risk_no, risk_name, risk_statement, cause, controls]).strip()
         if not combined_gate:
             blank_streak += 1
@@ -734,7 +722,6 @@ def parse_structured_sheet(
             continue
         blank_streak = 0
 
-        # Skip obvious metadata/headers
         lower_gate = combined_gate.lower()
         metadata_indicators = [
             "risk description", "risk definition", "link to objective", "control effectiveness",
@@ -747,7 +734,6 @@ def parse_structured_sheet(
         if risk_name.startswith("=") or risk_statement.startswith("="):
             continue
 
-        # Compute scores
         residual, inherent, impact_score, likelihood_score, control_eff_numeric, control_eff_text = compute_scores(
             raw_impact=raw_impact_text,
             raw_likelihood=raw_likelihood_text,
@@ -767,6 +753,8 @@ def parse_structured_sheet(
 
         raw_rows.append({
             "division": division_name,
+            "division_source": division_source,
+            "division_confidence": division_conf,
             "risk_no": risk_no,
             "objective_link": objective,
             "risk_name": risk_name,
@@ -791,10 +779,8 @@ def parse_structured_sheet(
             "source_row": row_idx,
         })
 
-    # Merge continuation rows
     raw_rows = merge_continuation_rows(raw_rows)
 
-    # Validate and score each row
     accepted_risks = []
     for row in raw_rows:
         is_valid, confidence, reason = is_valid_risk_record(row)
@@ -840,7 +826,7 @@ def parse_structured_risk_register(
     default_residual: int
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     debug_info: Dict[str, Any] = {
-        "parser": "intelligent_structured_v6",
+        "parser": "intelligent_structured_v8",
         "candidate_sheets": [],
         "selected_sheets": [],
         "error": None,
@@ -937,9 +923,11 @@ def simple_fallback_parser(
                                 "risk no", "division/ dept",
                             ]
                             if not any(ind in text.lower() for ind in metadata_indicators):
-                                division_name = get_division_for_risk(file_name, sheet_name, None)
+                                division_name, division_source, division_conf = get_division_for_risk(file_name, sheet_name, None)
                                 row = {
                                     "division": division_name,
+                                    "division_source": division_source,
+                                    "division_confidence": division_conf,
                                     "risk_no": "",
                                     "objective_link": "",
                                     "risk_name": text[:80],
@@ -1027,9 +1015,14 @@ Content:
             stmt = r.get("risk_statement", "")
             if not stmt or len(stmt) < 15:
                 continue
-            division_name = infer_division_from_filename(file_name) or "Unknown Division"
+            inferred = infer_division_from_filename(file_name)
+            division_name = inferred["division"]
+            division_source = inferred["source"]
+            division_conf = inferred["confidence"]
             row = {
                 "division": division_name,
+                "division_source": division_source,
+                "division_confidence": division_conf,
                 "risk_name": r.get("risk_name", stmt[:50]),
                 "risk_statement": stmt[:500],
                 "category": "Uncategorised",
@@ -1063,19 +1056,16 @@ def parse_uploaded_file_bytes(
     file_name: str,
     default_residual: int
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    # 1. Intelligent structured parser
     df, debug = parse_structured_risk_register(file_bytes, file_name, default_residual)
     if not df.empty:
         st.success(f"✅ Extracted {len(df)} risks (acceptance rate {debug.get('acceptance_rate', 0)}%)")
         return df, debug
 
-    # 2. Simple fallback
     df, fallback_debug = simple_fallback_parser(file_bytes, file_name, default_residual)
     if not df.empty:
         st.warning(f"⚠️ Simple fallback extracted {len(df)} potential risks")
         return df, fallback_debug
 
-    # 3. Gemini fallback
     if GEMINI_AVAILABLE and st.session_state.force_gemini:
         df, gemini_debug = gemini_extract_risks(file_bytes, file_name, default_residual)
         if not df.empty:
@@ -1089,11 +1079,6 @@ def parse_uploaded_file_bytes(
 # ENTERPRISE REGISTER BUILDING (WITH CONFIDENCE SCORING)
 # =============================================================================
 def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Build enterprise register with cluster confidence scores.
-    Returns (enterprise_df, clusters_detail_df) where clusters_detail_df contains
-    low-confidence clusters for review.
-    """
     if raw_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -1106,6 +1091,7 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
     owners = raw_df["owner"].tolist()
     acceptance_scores = raw_df["acceptance_score"].tolist()
     parser_confidences = raw_df["parser_confidence"].tolist()
+    division_confidences = raw_df["division_confidence"].tolist()
     source_files = raw_df["source_file"].tolist()
     source_sheets = raw_df["source_sheet"].tolist()
     source_rows = raw_df["source_row"].tolist()
@@ -1140,16 +1126,17 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         cluster_owners = [owners[idx] for idx in indices]
         cluster_acceptance = [acceptance_scores[idx] for idx in indices]
         cluster_parser_conf = [parser_confidences[idx] for idx in indices]
+        cluster_div_conf = [division_confidences[idx] for idx in indices]
         cluster_sources = [
             f"{source_files[idx]}:{source_sheets[idx]}:row{source_rows[idx]}"
             for idx in indices
         ]
 
-        # Cluster confidence components
         avg_similarity = sum(similarities) / len(similarities) if similarities else 0
         size_penalty = min(1.0, len(indices) / 5)
         acceptance_avg = sum(cluster_acceptance) / len(cluster_acceptance)
         parser_conf_avg = sum(cluster_parser_conf) / len(cluster_parser_conf)
+        div_conf_avg = sum(cluster_div_conf) / len(cluster_div_conf)
 
         unique_divs = set(cluster_divisions)
         div_consistency = 1.0 if len(unique_divs) == 1 else 0.6 if len(unique_divs) <= 2 else 0.3
@@ -1158,12 +1145,13 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         cat_consistency = 1.0 if len(unique_cats) == 1 else 0.7 if len(unique_cats) <= 2 else 0.4
 
         cluster_confidence = (
-            (avg_similarity / 100) * 0.35 +
+            (avg_similarity / 100) * 0.30 +
             (acceptance_avg / 10) * 0.20 +
             (parser_conf_avg) * 0.15 +
+            (div_conf_avg) * 0.10 +
             size_penalty * 0.10 +
             div_consistency * 0.10 +
-            cat_consistency * 0.10
+            cat_consistency * 0.05
         ) * 100
         cluster_confidence = round(min(100, cluster_confidence))
 
@@ -1216,9 +1204,6 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
     return enterprise_df, clusters_detail_df
 
 def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[Dict]]:
-    """
-    Returns (raw_df, enterprise_df, clusters_detail_df, debug_list)
-    """
     all_raw = []
     all_debug = []
     total_scanned = 0
@@ -1980,6 +1965,9 @@ def main():
                             st.markdown(f"**File {i+1}**")
                             st.json(debug)
                 else:
+                    # Safety gate: warn if all divisions are Unknown Division
+                    if (enterprise_df["primary_division"] == "Unknown Division").all():
+                        st.warning("⚠️ Division detection failed. Enterprise intelligence may be unreliable until lineage is restored.")
                     st.success(f"✅ {len(enterprise_df)} enterprise risks consolidated from {len(raw_df)} raw accepted risks")
                     if st.session_state.debug_mode:
                         with st.expander("🔧 Enterprise Risks Preview"):
