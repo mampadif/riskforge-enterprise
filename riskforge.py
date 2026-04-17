@@ -1055,7 +1055,7 @@ def detect_semantic_duplicates(df: pd.DataFrame, threshold: float = 0.85) -> Tup
     return deduped, duplicates_df
 
 # =============================================================================
-# AI FUNCTIONS
+# AI FUNCTIONS (ENHANCED)
 # =============================================================================
 def ai_infer_category(statement: str, fallback: str = "Uncategorised") -> str:
     categories = ["Strategic", "Financial", "Operational", "ICT/Cyber", "Compliance/Legal", "People/HR", "Health/Safety", "Reputational", "Environmental"]
@@ -1072,22 +1072,55 @@ def ai_infer_category(statement: str, fallback: str = "Uncategorised") -> str:
     return fallback
 
 def ai_polish_narrative(snapshot: Dict, company: str) -> str:
+    # Legacy function, kept for compatibility
+    return ai_executive_briefing(snapshot, [], {}, company)
+
+def ai_executive_briefing(snapshot: Dict, correlations: List[Dict], recommendations: Dict, company: str) -> str:
     if not GEMINI_AVAILABLE:
         return ""
+    
+    context = f"""
+    Company: {company}
+    Health Score: {snapshot.get('enterprise_health_score', 0)}/100
+    Total Risks: {snapshot.get('total_risks', 0)}
+    Critical+High: {snapshot.get('critical_count', 0) + snapshot.get('high_count', 0)}
+    Top Division: {snapshot.get('top_division', 'N/A')} ({snapshot.get('top_division_pct', 0)}% of exposure)
+    Appetite Breached: {snapshot.get('pct_breached', 0)}%
+    Treatment Confidence: {snapshot.get('treatment_confidence', 0)}%
+    
+    Cross-Division Correlations Found: {len(correlations)}
+    """
+    
+    if correlations:
+        context += "\nTop Correlated Risks Across Divisions:\n"
+        for corr in correlations[:3]:
+            context += f"- {corr['risk_a']['name']} ({corr['risk_a']['division']}) ↔ {corr['risk_b']['name']} ({corr['risk_b']['division']}) - {corr['similarity']}% similar\n"
+    
+    if recommendations:
+        context += f"\nThreshold Recommendation: {recommendations.get('global', {}).get('recommended', 'N/A')} (current: {snapshot.get('threshold', 12)})\n"
+    
+    prompt = f"""
+    You are a Chief Risk Officer writing a board‑level executive briefing.
+    Based on the data below, write a concise but insightful 4‑5 sentence briefing that:
+    - Highlights the most critical enterprise health indicators.
+    - Identifies cross‑divisional risk patterns and what they mean.
+    - Suggests 1‑2 actionable focus areas for the next quarter.
+    - Uses professional, confident language suitable for the board.
+    
+    Data:
+    {context}
+    
+    Briefing:
+    """
+    
     try:
-        prompt = f"""Write a professional, board‑ready executive briefing (2‑3 sentences) for {company}:
-- Health score: {snapshot.get('enterprise_health_score', 0)}/100
-- Critical/high risks: {snapshot.get('critical_count', 0) + snapshot.get('high_count', 0)}
-- Top division: {snapshot.get('top_division', 'N/A')}
-- Appetite breached: {snapshot.get('pct_breached', 0)}%
-Be concise, actionable."""
         response = ai_model.generate_content(prompt)
-        return response.text.strip() if response.text else ""
+        return response.text.strip()
     except:
         return ""
 
 # =============================================================================
-# INTELLIGENCE ENGINE
+# INTELLIGENCE ENGINE (ENHANCED)
 # =============================================================================
 def calculate_weighted_treatment_confidence(row: pd.Series) -> float:
     score = 0.0
@@ -1167,6 +1200,84 @@ def detect_emerging_themes(df: pd.DataFrame) -> List[str]:
             themes.append(theme)
     return themes
 
+def find_cross_division_correlations(df: pd.DataFrame, threshold: float = 0.75) -> List[Dict]:
+    if df.empty or len(df["division"].unique()) < 2:
+        return []
+    
+    correlations = []
+    statements = df["risk_statement"].fillna("").tolist()
+    divisions = df["division"].tolist()
+    risk_names = df["risk_name"].tolist()
+    
+    for i in range(len(statements)):
+        for j in range(i + 1, len(statements)):
+            if divisions[i] == divisions[j]:
+                continue
+            
+            text_i = f"{risk_names[i]} {statements[i]}"
+            text_j = f"{risk_names[j]} {statements[j]}"
+            
+            similarity = fuzz.ratio(text_i.lower(), text_j.lower()) / 100.0
+            if similarity >= threshold:
+                correlations.append({
+                    "risk_a": {"name": risk_names[i], "division": divisions[i], "statement": statements[i][:200]},
+                    "risk_b": {"name": risk_names[j], "division": divisions[j], "statement": statements[j][:200]},
+                    "similarity": round(similarity * 100, 1)
+                })
+    
+    correlations.sort(key=lambda x: x["similarity"], reverse=True)
+    return correlations[:10]
+
+def recommend_appetite_thresholds(df: pd.DataFrame, current_threshold: int) -> Dict[str, Any]:
+    if df.empty:
+        return {}
+    
+    recommendations = {}
+    overall_q75 = df["residual_score"].quantile(0.75)
+    
+    recommendations["global"] = {
+        "current": current_threshold,
+        "recommended": int(min(25, max(6, round(overall_q75)))),
+        "reason": f"75th percentile of residual scores is {overall_q75:.1f}"
+    }
+    
+    for category in df["category"].unique():
+        cat_df = df[df["category"] == category]
+        if len(cat_df) >= 3:
+            cat_q75 = cat_df["residual_score"].quantile(0.75)
+            recommendations[category] = {
+                "recommended": int(min(25, max(6, round(cat_q75)))),
+                "reason": f"75th percentile for {category} risks is {cat_q75:.1f}"
+            }
+    
+    return recommendations
+
+def analyze_trends(current: Dict, previous: Dict) -> Dict[str, Any]:
+    if not previous:
+        return {}
+    
+    trends = {}
+    health_delta = current.get("enterprise_health_score", 0) - previous.get("enterprise_health_score", 0)
+    trends["health_trend"] = "improving" if health_delta > 0 else "declining" if health_delta < 0 else "stable"
+    trends["health_delta"] = health_delta
+    
+    breach_delta = current.get("pct_breached", 0) - previous.get("pct_breached", 0)
+    trends["breach_trend"] = "worsening" if breach_delta > 0 else "improving" if breach_delta < 0 else "stable"
+    
+    prev_cat = previous.get("category_exposure", {})
+    curr_cat = current.get("category_exposure", {})
+    growth = {}
+    for cat, exp in curr_cat.items():
+        prev_exp = prev_cat.get(cat, 0)
+        if prev_exp > 0:
+            growth[cat] = (exp - prev_exp) / prev_exp * 100
+    
+    if growth:
+        fastest = max(growth, key=growth.get)
+        trends["fastest_growing_category"] = {"category": fastest, "growth_pct": round(growth[fastest], 1)}
+    
+    return trends
+
 def build_intelligence_snapshot(df: pd.DataFrame, threshold: int, category_appetite: Dict = None) -> Dict[str, Any]:
     if df.empty:
         return {}
@@ -1198,6 +1309,7 @@ def build_intelligence_snapshot(df: pd.DataFrame, threshold: int, category_appet
     snapshot["total_risks"] = len(df)
     snapshot["board_risks"] = df.nlargest(5, "residual_score")[["risk_name", "division", "residual_score", "owner", "category"]].to_dict("records")
     snapshot["risks_list"] = df[["risk_name", "residual_score", "owner", "division"]].to_dict("records")
+    snapshot["threshold"] = threshold
     return snapshot
 
 def compare_snapshots(current: Dict, previous: Dict) -> Dict[str, Any]:
@@ -1269,7 +1381,7 @@ def generate_board_narrative(snapshot: Dict, comparison: Dict, threshold: int, c
     return "\n".join(narrative)
 
 # =============================================================================
-# EXCEL & PDF EXPORTS
+# EXCEL & PDF EXPORTS (INTELLIGENT)
 # =============================================================================
 def style_excel_with_risk_colors(wb):
     level_colors = {
@@ -1293,7 +1405,7 @@ def style_excel_with_risk_colors(wb):
                 for col in range(1, ws.max_column + 1):
                     ws.cell(row=row, column=col).fill = fill
 
-def generate_excel_pack(data: Dict[str, Any], narrative: str) -> io.BytesIO:
+def generate_intelligent_excel_pack(data: Dict[str, Any], narrative: str, correlations: List[Dict], trends: Dict) -> io.BytesIO:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         summary = pd.DataFrame({
@@ -1322,6 +1434,22 @@ def generate_excel_pack(data: Dict[str, Any], narrative: str) -> io.BytesIO:
         if st.session_state.parser_audit:
             audit_df = pd.DataFrame([st.session_state.parser_audit])
             audit_df.to_excel(writer, sheet_name="Parser Audit", index=False)
+        # New intelligence sheets
+        if correlations:
+            corr_df = pd.DataFrame([{
+                "Risk A Name": c["risk_a"]["name"],
+                "Risk A Division": c["risk_a"]["division"],
+                "Risk B Name": c["risk_b"]["name"],
+                "Risk B Division": c["risk_b"]["division"],
+                "Similarity %": c["similarity"]
+            } for c in correlations])
+            corr_df.to_excel(writer, sheet_name="Cross-Division Correlations", index=False)
+        if trends:
+            trends_df = pd.DataFrame([trends])
+            trends_df.to_excel(writer, sheet_name="Trend Analysis", index=False)
+        briefing_df = pd.DataFrame({"Executive Briefing": [data.get("ai_summary", "")]})
+        briefing_df.to_excel(writer, sheet_name="AI Executive Briefing", index=False)
+    
     output.seek(0)
     wb = load_workbook(output)
     style_excel_with_risk_colors(wb)
@@ -1826,12 +1954,18 @@ def main():
                     category_appetite = st.session_state.category_appetite if st.session_state.tier == "enterprise" else None
                     snapshot = build_intelligence_snapshot(df_all, st.session_state.board_threshold, category_appetite)
                     comparison = {}
+                    trends = {}
                     if st.session_state.history:
                         comparison = compare_snapshots(snapshot, st.session_state.history[-1])
+                        trends = analyze_trends(snapshot, st.session_state.history[-1])
+                    
+                    correlations = find_cross_division_correlations(df_all)
+                    recommendations = recommend_appetite_thresholds(df_all, st.session_state.board_threshold)
+                    
                     ai_summary = ""
                     if st.session_state.tier != "free" and GEMINI_AVAILABLE:
-                        safe_snapshot = make_json_serializable(snapshot)
-                        ai_summary = cached_ai_summary(json.dumps(safe_snapshot), st.session_state.org_name)
+                        ai_summary = ai_executive_briefing(snapshot, correlations, recommendations, st.session_state.org_name)
+                    
                     narrative = generate_board_narrative(snapshot, comparison, st.session_state.board_threshold, st.session_state.org_name, st.session_state.report_title, ai_summary)
                     st.session_state.rf_data = {
                         "risks_df": df_all,
@@ -1859,13 +1993,16 @@ def main():
                         "board_risks": snapshot.get("board_risks", []),
                         "narrative": narrative,
                         "comparison": comparison,
+                        "trends": trends,
+                        "correlations": correlations,
+                        "recommendations": recommendations,
                         "ai_summary": ai_summary
                     }
                     st.session_state.history.append(snapshot)
                     if len(st.session_state.history) > 4:
                         st.session_state.history = st.session_state.history[-4:]
                     if st.session_state.tier != "free":
-                        excel_data = generate_excel_pack(st.session_state.rf_data, narrative)
+                        excel_data = generate_intelligent_excel_pack(st.session_state.rf_data, narrative, correlations, trends)
                         st.download_button("📥 Excel Board Pack", excel_data, file_name=f"RiskForge_{datetime.now().strftime('%Y%m%d')}.xlsx")
                         if st.session_state.tier == "enterprise":
                             pdf_data = generate_pdf_board_pack(narrative, snapshot, st.session_state.org_name, st.session_state.report_title, st.session_state.logo_bytes)
@@ -2230,6 +2367,29 @@ def main():
                     </div>
                     """, unsafe_allow_html=True)
 
+            # Cross-Division Correlations
+            correlations = data.get("correlations", [])
+            if correlations:
+                with st.expander("🔗 Cross‑Division Risk Correlations", expanded=True):
+                    for corr in correlations[:5]:
+                        st.markdown(f"""
+                        <div style="background:#f1f5f9; border-radius:12px; padding:12px; margin-bottom:8px;">
+                            <div style="display:flex; align-items:center; gap:12px;">
+                                <div style="flex:1;"><b>{corr['risk_a']['name']}</b><br><small>{corr['risk_a']['division']}</small></div>
+                                <div style="background:#0E365C; color:white; padding:4px 12px; border-radius:20px;">{corr['similarity']}% match</div>
+                                <div style="flex:1;"><b>{corr['risk_b']['name']}</b><br><small>{corr['risk_b']['division']}</small></div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+            # Threshold Recommendations
+            recommendations = data.get("recommendations", {})
+            if recommendations:
+                with st.expander("🎯 Appetite Threshold Recommendations", expanded=False):
+                    rec = recommendations.get("global", {})
+                    st.markdown(f"**Recommended Global Threshold:** {rec.get('recommended', 'N/A')} (current: {data['threshold']})")
+                    st.caption(rec.get('reason', ''))
+
             st.markdown("""
             <div style="margin-top: 24px;">
                 <div class="exec-card-header" style="margin-bottom: 16px;">
@@ -2311,6 +2471,18 @@ def main():
                     st.markdown(f"**Appetite Breach Change:** {abs(comp['appetite_delta']):.1f}% {direction}")
             else:
                 st.info("Upload another register next quarter to see trend analysis.")
+            
+            trends = data.get("trends", {})
+            if trends:
+                with st.expander("📈 Advanced Trend Analysis", expanded=False):
+                    if trends.get("health_trend"):
+                        st.markdown(f"**Health Trend:** {trends['health_trend']} ({trends.get('health_delta', 0):+.1f} pts)")
+                    if trends.get("breach_trend"):
+                        st.markdown(f"**Appetite Breach Trend:** {trends['breach_trend']}")
+                    if trends.get("fastest_growing_category"):
+                        fgc = trends["fastest_growing_category"]
+                        st.markdown(f"**Fastest Growing Risk Category:** {fgc['category']} (+{fgc['growth_pct']}%)")
+        
         with tab5:
             st.subheader("Export Options")
             if st.session_state.tier != "free":
