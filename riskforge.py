@@ -31,6 +31,29 @@ except ImportError:
     EMBEDDING_AVAILABLE = False
 
 # =============================================================================
+# HEALTH SCORE WEIGHTS (adjustable, not hardcoded)
+# =============================================================================
+HEALTH_WEIGHTS = {
+    "exposure": 0.40,           # residual exposure burden
+    "control": 0.25,            # control effectiveness
+    "treatment": 0.20,          # treatment delivery confidence
+    "appetite": 0.10,           # appetite compliance
+    "concentration_penalty": 0.05  # penalty for concentration risk
+}
+
+# Posture thresholds (score -> label)
+POSTURE_THRESHOLDS = [
+    (80, "Strong"),
+    (65, "Stable"),
+    (50, "Elevated"),
+    (0, "Attention Required")
+]
+
+# Concentration penalty triggers
+CONCENTRATION_PENALTY_THRESHOLD = 0.4   # top division >40% of exposure triggers penalty
+MAX_CONCENTRATION_PENALTY = 20          # max penalty points (out of 100)
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 st.set_page_config(page_title="RiskForge Enterprise", page_icon="🛡️", layout="wide")
@@ -120,7 +143,7 @@ def cached_parse_file(file_bytes: bytes, file_name: str, default_residual: int) 
     return parse_uploaded_file_bytes(file_bytes, file_name, default_residual)
 
 # =============================================================================
-# UNIVERSAL PARSER HELPERS
+# UNIVERSAL PARSER HELPERS (unchanged, but included for completeness)
 # =============================================================================
 def normalize_text(val: Any) -> str:
     if val is None:
@@ -373,7 +396,7 @@ def infer_category_from_text(title: str, statement: str, cause: str, raw_categor
     return "Operational"
 
 # =============================================================================
-# SHEET / HEADER DISCOVERY
+# SHEET / HEADER DISCOVERY (unchanged)
 # =============================================================================
 FIELD_PATTERNS: Dict[str, List[str]] = {
     "risk_no": [r"risk\s*no", r"risk\s*id", r"identifier"],
@@ -464,7 +487,7 @@ def rank_candidate_sheets(wb) -> List[Dict[str, Any]]:
     return candidates
 
 # =============================================================================
-# ROW ACCEPTANCE SCORING
+# ROW ACCEPTANCE SCORING (unchanged)
 # =============================================================================
 def is_valid_risk_record(row: Dict[str, Any]) -> Tuple[bool, int, str]:
     evidence = 0
@@ -575,7 +598,6 @@ def parse_risk_score(val: Any) -> Optional[float]:
     return None
 
 def parse_control_effectiveness(val: Any) -> Optional[float]:
-    """Parse control effectiveness to a factor between 0.0 and 1.0."""
     if val is None:
         return None
     try:
@@ -792,7 +814,7 @@ def parse_structured_sheet(
     return pd.DataFrame(accepted_risks), debug
 
 # =============================================================================
-# UNIVERSAL PARSER ENTRY POINT
+# UNIVERSAL PARSER ENTRY POINT (unchanged)
 # =============================================================================
 def parse_structured_risk_register(
     file_bytes: bytes,
@@ -860,7 +882,7 @@ def parse_structured_risk_register(
         return pd.DataFrame(), debug_info
 
 # =============================================================================
-# SIMPLE FALLBACK PARSER
+# SIMPLE FALLBACK PARSER (unchanged)
 # =============================================================================
 def simple_fallback_parser(
     file_bytes: bytes,
@@ -950,7 +972,7 @@ def simple_fallback_parser(
     return pd.DataFrame(), debug_info
 
 # =============================================================================
-# FINAL DISPATCHER
+# FINAL DISPATCHER (unchanged)
 # =============================================================================
 def parse_uploaded_file_bytes(
     file_bytes: bytes,
@@ -970,7 +992,7 @@ def parse_uploaded_file_bytes(
     return pd.DataFrame(), debug
 
 # =============================================================================
-# ENTERPRISE REGISTER BUILDING
+# ENTERPRISE REGISTER BUILDING (unchanged)
 # =============================================================================
 def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if raw_df.empty:
@@ -1207,7 +1229,7 @@ def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[p
     return raw_df, enterprise_df, clusters_detail_df, all_debug
 
 # =============================================================================
-# INTELLIGENCE ENGINE
+# INTELLIGENCE ENGINE (UPDATED HEALTH SCORE)
 # =============================================================================
 def appetite_band(score: float, threshold: int, category: str = "", category_appetite: Dict = None) -> str:
     if pd.isna(score):
@@ -1223,23 +1245,61 @@ def appetite_band(score: float, threshold: int, category: str = "", category_app
     return "within appetite"
 
 def calculate_enterprise_health_score(df: pd.DataFrame) -> float:
+    """
+    Calculate a realistic enterprise health score based on configurable weights.
+    Uses global HEALTH_WEIGHTS dictionary.
+    """
     if df.empty:
         return 0.0
-    score = 100.0
-    critical_pct = (df["residual_level"] == "Critical").mean() * 100
-    score -= critical_pct * 0.8
-    high_pct = (df["residual_level"] == "High").mean() * 100
-    score -= high_pct * 0.3
-    if "cluster_confidence" in df.columns:
-        low_conf_pct = (df["cluster_confidence"] < 60).mean() * 100
-        score -= low_conf_pct * 0.2
+
+    # 1. Residual exposure burden (weighted)
+    critical_high_ratio = (df["residual_level"].isin(["Critical", "High"])).mean()
+    # Scale: 0% critical/high -> 100, 100% -> 0
+    exposure_score = (1 - critical_high_ratio) * 100
+
+    # 2. Control effectiveness (weighted)
+    if "avg_control_effectiveness" in df.columns and df["avg_control_effectiveness"].notna().any():
+        avg_control = df["avg_control_effectiveness"].mean()
+    else:
+        avg_control = df["mitigation_strength_pct"].mean() / 100
+    control_score = avg_control * 100
+
+    # 3. Treatment confidence (weighted)
     if "treatment_status" in df.columns:
-        overdue_pct = (df["treatment_status"] == "Overdue").mean() * 100
-        score -= overdue_pct * 0.5
-    if "avg_control_effectiveness" in df.columns:
-        weak_ctrl_pct = (df["avg_control_effectiveness"] < 0.3).mean() * 100
-        score -= weak_ctrl_pct * 0.4
-    return max(0.0, round(score, 1))
+        on_track_ratio = (df["treatment_status"] == "On Track").mean()
+        completed_ratio = (df["treatment_status"] == "Completed").mean()
+        treatment_score = (on_track_ratio * 70 + completed_ratio * 100)
+    else:
+        treatment_score = 50
+
+    # 4. Appetite compliance (weighted)
+    if "appetite_band" in df.columns:
+        within_ratio = (df["appetite_band"] == "within appetite").mean()
+        near_ratio = (df["appetite_band"] == "near appetite").mean()
+        appetite_score = (within_ratio * 100 + near_ratio * 50)
+    else:
+        appetite_score = 50
+
+    # 5. Concentration penalty (reduces final score)
+    div_exposure = df.groupby("primary_division")["residual_score"].sum()
+    if not div_exposure.empty:
+        top_div_pct = div_exposure.max() / div_exposure.sum()
+        if top_div_pct > CONCENTRATION_PENALTY_THRESHOLD:
+            penalty = min(MAX_CONCENTRATION_PENALTY, (top_div_pct - CONCENTRATION_PENALTY_THRESHOLD) * 100)
+        else:
+            penalty = 0
+    else:
+        penalty = 0
+
+    # Weighted sum, then subtract penalty
+    final_score = (
+        exposure_score * HEALTH_WEIGHTS["exposure"] +
+        control_score * HEALTH_WEIGHTS["control"] +
+        treatment_score * HEALTH_WEIGHTS["treatment"] +
+        appetite_score * HEALTH_WEIGHTS["appetite"] -
+        penalty * HEALTH_WEIGHTS["concentration_penalty"]
+    )
+    return max(0.0, round(final_score, 1))
 
 def detect_emerging_themes(df: pd.DataFrame) -> List[str]:
     if df.empty:
@@ -1320,7 +1380,12 @@ def generate_board_narrative(snapshot: Dict, threshold: int, company: str, repor
     narrative.append(f"**Reporting Period:** Q{((datetime.now().month-1)//3)+1} {datetime.now().year}")
     narrative.append("")
     health = snapshot.get("enterprise_health_score", 0)
-    posture = "Strong" if health >= 80 else "Stable" if health >= 60 else "Elevated" if health >= 40 else "Critical"
+    # Get posture from thresholds
+    posture = "Unknown"
+    for score_threshold, label in POSTURE_THRESHOLDS:
+        if health >= score_threshold:
+            posture = label
+            break
     narrative.append(f"## 1. Executive Posture Summary")
     narrative.append(f"**Enterprise Health Score:** {health}/100 ({posture})")
     narrative.append(f"**Total Enterprise Risks:** {snapshot.get('critical_count', 0) + snapshot.get('high_count', 0)} critical/high, {snapshot.get('avg_residual', 0):.1f}/25 average residual")
@@ -1355,7 +1420,7 @@ def generate_board_narrative(snapshot: Dict, threshold: int, company: str, repor
     return "\n".join(narrative)
 
 # =============================================================================
-# EXCEL & PDF EXPORTS
+# EXCEL & PDF EXPORTS (unchanged)
 # =============================================================================
 def style_excel_with_risk_colors(wb):
     level_colors = {
@@ -1476,7 +1541,7 @@ def generate_pdf_board_pack(narrative: str, snapshot: Dict, company: str, report
     return buffer.getvalue()
 
 # =============================================================================
-# DASHBOARD CHARTS
+# DASHBOARD CHARTS (unchanged)
 # =============================================================================
 def create_category_chart(df: pd.DataFrame) -> go.Figure:
     if df.empty:
@@ -1521,7 +1586,7 @@ def create_treatment_gauge(confidence: float) -> go.Figure:
     return fig
 
 # =============================================================================
-# UI COMPONENTS
+# UI COMPONENTS (unchanged, but posture uses global thresholds)
 # =============================================================================
 def apply_custom_theme(primary: str, secondary: str) -> None:
     st.markdown(f"""
@@ -1826,14 +1891,22 @@ def main():
     else:
         health = 0
 
-    if health >= 80:
-        posture, posture_color, posture_bg = "Strong", "#10b981", "#d1fae5"
-    elif health >= 60:
-        posture, posture_color, posture_bg = "Stable", "#3b82f6", "#dbeafe"
-    elif health >= 40:
-        posture, posture_color, posture_bg = "Elevated", "#f59e0b", "#fef3c7"
-    else:
-        posture, posture_color, posture_bg = "Critical", "#ef4444", "#fee2e2"
+    # Determine posture based on global thresholds
+    posture = "Unknown"
+    posture_color = "#475569"
+    posture_bg = "#f1f5f9"
+    for score_threshold, label in POSTURE_THRESHOLDS:
+        if health >= score_threshold:
+            posture = label
+            if label == "Strong":
+                posture_color, posture_bg = "#10b981", "#d1fae5"
+            elif label == "Stable":
+                posture_color, posture_bg = "#3b82f6", "#dbeafe"
+            elif label == "Elevated":
+                posture_color, posture_bg = "#f59e0b", "#fef3c7"
+            elif label == "Attention Required":
+                posture_color, posture_bg = "#ef4444", "#fee2e2"
+            break
 
     col_logo, col_hero = st.columns([0.5, 5])
     with col_logo:
@@ -1895,7 +1968,7 @@ def main():
                 """, unsafe_allow_html=True)
             with col3:
                 health_val = data['enterprise_health_score']
-                health_color = "#10b981" if health_val >= 80 else "#3b82f6" if health_val >= 60 else "#f59e0b" if health_val >= 40 else "#ef4444"
+                health_color = "#10b981" if health_val >= 80 else "#3b82f6" if health_val >= 65 else "#f59e0b" if health_val >= 50 else "#ef4444"
                 st.markdown(f"""
                 <div class="kpi-card">
                     <div class="kpi-label">❤️ Health Score</div>
@@ -2012,22 +2085,31 @@ def main():
             threshold = data.get("threshold", st.session_state.board_threshold)
             category_appetite = st.session_state.category_appetite if st.session_state.tier == "enterprise" else {}
 
+            # Build HTML table with improved coloring including dark green for low residual scores
             html_table = '<table class="register-table">'
             html_table += '<thead><tr>'
             for col in display_df.columns:
                 html_table += f'<th>{col}</th>'
-            html_table += '</tr></thead><tbody>'
+            html_table += '</thead><tbody>'
 
             for _, row in display_df.iterrows():
-                band = appetite_band(row["Residual Score"], threshold, row.get("Category", ""), category_appetite)
-                if band in ["breached", "critical breach"]:
-                    row_bg = "#fee2e2"
-                elif band == "near appetite":
-                    row_bg = "#fef3c7"
-                elif band == "within appetite":
-                    row_bg = "#dcfce7"
+                residual_score = row["Residual Score"]
+                # Determine row background based on residual score first (lowest gets dark green)
+                if residual_score <= 5:
+                    row_bg = "#166534"          # dark green
+                elif residual_score <= 8:
+                    row_bg = "#15803d"          # medium-dark green
                 else:
-                    row_bg = "#ffffff"
+                    # fallback to appetite-based colors
+                    band = appetite_band(residual_score, threshold, row.get("Category", ""), category_appetite)
+                    if band in ["breached", "critical breach"]:
+                        row_bg = "#fee2e2"       # light red
+                    elif band == "near appetite":
+                        row_bg = "#fef3c7"       # light yellow
+                    elif band == "within appetite":
+                        row_bg = "#dcfce7"       # light green
+                    else:
+                        row_bg = "#ffffff"
 
                 html_table += f'<tr style="background-color: {row_bg};">'
                 for col_name, value in row.items():
@@ -2051,14 +2133,16 @@ def main():
                     elif col_name in ["Inherent Score", "Residual Score"]:
                         try:
                             score = float(value)
-                            if score >= 20:
+                            if score <= 5:
+                                cell_style = "background-color: #166534; color: white; font-weight: 700;"
+                            elif score <= 8:
+                                cell_style = "background-color: #15803d; color: white; font-weight: 700;"
+                            elif score >= 20:
                                 cell_style = "background-color: #dc2626; color: white; font-weight: 700;"
                             elif score >= 12:
                                 cell_style = "background-color: #f59e0b; color: white; font-weight: 700;"
                             elif score >= 6:
                                 cell_style = "background-color: #fef3c7; color: #92400e; font-weight: 600;"
-                            else:
-                                cell_style = "background-color: #dcfce7; color: #166534; font-weight: 600;"
                         except:
                             pass
                     elif col_name == "Mitigation %":
