@@ -31,7 +31,7 @@ except ImportError:
     EMBEDDING_AVAILABLE = False
 
 # =============================================================================
-# HEALTH SCORE WEIGHTS (adjustable, not hardcoded)
+# HEALTH SCORE WEIGHTS (adjustable)
 # =============================================================================
 HEALTH_WEIGHTS = {
     "exposure": 0.40,           # residual exposure burden
@@ -52,6 +52,27 @@ POSTURE_THRESHOLDS = [
 # Concentration penalty triggers
 CONCENTRATION_PENALTY_THRESHOLD = 0.4   # top division >40% of exposure triggers penalty
 MAX_CONCENTRATION_PENALTY = 20          # max penalty points (out of 100)
+
+# =============================================================================
+# RISK MATRIX BANDS (based on your image)
+# =============================================================================
+# Risk index: 1-4 Low, 5-12 Medium, 15-25 High
+def get_risk_level(score: float) -> str:
+    if score <= 4:
+        return "Low"
+    elif score <= 12:
+        return "Medium"
+    else:
+        return "High"
+
+def get_risk_color(score: float) -> str:
+    """Return background color for the residual score cell."""
+    if score <= 4:
+        return "#166534"   # dark green
+    elif score <= 12:
+        return "#f59e0b"   # amber/orange
+    else:
+        return "#dc2626"   # red
 
 # =============================================================================
 # CONFIGURATION
@@ -143,7 +164,7 @@ def cached_parse_file(file_bytes: bytes, file_name: str, default_residual: int) 
     return parse_uploaded_file_bytes(file_bytes, file_name, default_residual)
 
 # =============================================================================
-# UNIVERSAL PARSER HELPERS (unchanged, but included for completeness)
+# UNIVERSAL PARSER HELPERS (unchanged from previous working version)
 # =============================================================================
 def normalize_text(val: Any) -> str:
     if val is None:
@@ -161,7 +182,6 @@ def merged_cell_value(ws, row_idx: int, col_idx: int) -> Any:
     cell = ws.cell(row=row_idx, column=col_idx)
     if cell.value is not None:
         return cell.value
-
     for merged_range in ws.merged_cells.ranges:
         if (merged_range.min_row <= row_idx <= merged_range.max_row
                 and merged_range.min_col <= col_idx <= merged_range.max_col):
@@ -175,11 +195,9 @@ def parse_due_date(val: Any) -> Optional[date]:
         return val.date()
     if isinstance(val, date):
         return val
-
     text = normalize_text(val)
     if not text:
         return None
-
     for fmt in [
         "%B %d, %Y", "%b %d, %Y", "%b-%y", "%B-%y",
         "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%d/%m/%Y",
@@ -189,7 +207,6 @@ def parse_due_date(val: Any) -> Optional[date]:
             return datetime.strptime(text, fmt).date()
         except Exception:
             pass
-
     parsed = pd.to_datetime(text, errors="coerce")
     if pd.notna(parsed):
         return parsed.date()
@@ -199,11 +216,7 @@ def is_year_like(text: str) -> bool:
     if not text:
         return False
     t = text.strip()
-    patterns = [
-        r"^\d{4}[\-/ ]?\d{2}$",
-        r"^\d{4}$",
-        r"^\d{2}[\-/]\d{2}$",
-    ]
+    patterns = [r"^\d{4}[\-/ ]?\d{2}$", r"^\d{4}$", r"^\d{2}[\-/]\d{2}$"]
     for pat in patterns:
         if re.match(pat, t):
             return True
@@ -213,44 +226,25 @@ def clean_division_value(val: Any) -> str:
     text = normalize_text(val)
     if not text:
         return ""
-
     if is_year_like(text):
         return ""
-
-    text = re.sub(
-        r"^(division\/dept|division|department|dept|directorate|function|unit)\s*[:\-]?\s*",
-        "",
-        text,
-        flags=re.I
-    )
+    text = re.sub(r"^(division\/dept|division|department|dept|directorate|function|unit)\s*[:\-]?\s*", "", text, flags=re.I)
     text = re.sub(r"\s+", " ", text).strip(" :-")
-
-    abbrev_map = {
-        "hr": "Human Resources",
-        "it": "Information Technology",
-        "ict": "Information Technology",
-        "ist": "Information Systems and Technology",
-        "nano": "Nanomaterials",
-        "mobility": "eMobility",
-    }
-
+    abbrev_map = {"hr": "Human Resources", "it": "Information Technology", "ict": "Information Technology",
+                  "ist": "Information Systems and Technology", "nano": "Nanomaterials", "mobility": "eMobility"}
     key = text.lower()
     if key in abbrev_map:
         return abbrev_map[key]
-
     return text.title()
 
 def looks_like_category(text: str) -> bool:
-    categories = {
-        "strategic", "financial", "operational", "compliance/legal", "people/hr",
-        "ict/cyber", "reputational", "health/safety", "environmental", "legal", "hr", "uncategorised",
-    }
+    categories = {"strategic", "financial", "operational", "compliance/legal", "people/hr",
+                  "ict/cyber", "reputational", "health/safety", "environmental", "legal", "hr", "uncategorised"}
     return normalize_text(text).lower() in categories
 
 def infer_division_from_filename(file_name: str) -> Dict[str, Any]:
     if not file_name:
         return {"division": "Unknown Division", "confidence": 0.0, "source": "filename"}
-
     name = file_name.lower()
     patterns = {
         "Human Resources": [r"\bhr\b", r"human resources?"],
@@ -261,48 +255,34 @@ def infer_division_from_filename(file_name: str) -> Dict[str, Any]:
         "Finance": [r"\bfinance\b", r"financial"],
         "Legal": [r"\blegal\b"],
     }
-
     for division, pats in patterns.items():
         if any(re.search(p, name) for p in pats):
             return {"division": division, "confidence": 0.85, "source": "filename"}
-
     return {"division": "Unknown Division", "confidence": 0.0, "source": "filename"}
 
 def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: int = 12) -> Optional[Dict[str, Any]]:
-    label_regex = re.compile(
-        r"^(division\/dept|division|department|dept|directorate|function|unit|business unit)\s*[:\-]?$",
-        re.I
-    )
-
-    max_row_to_scan = max(1, (header_row - 1) if header_row else 12)
-    max_row_to_scan = min(max_row_to_scan, 15)
-
+    label_regex = re.compile(r"^(division\/dept|division|department|dept|directorate|function|unit|business unit)\s*[:\-]?$", re.I)
+    max_row_to_scan = min(max(1, (header_row - 1) if header_row else 12), 15)
     for r in range(1, max_row_to_scan + 1):
         for c in range(1, min(scan_cols, ws.max_column) + 1):
             label = normalize_text(merged_cell_value(ws, r, c))
             if not label:
                 continue
-
             if label_regex.match(label):
                 candidates = []
                 for offset in range(1, 6):
                     candidates.append(merged_cell_value(ws, r, c + offset))
                 for offset in range(0, 6):
                     candidates.append(merged_cell_value(ws, r + 1, c + offset))
-
                 for cand in candidates:
                     cand_text = clean_division_value(cand)
                     if not cand_text or len(cand_text) < 2:
                         continue
-                    if is_year_like(cand_text):
+                    if is_year_like(cand_text) or looks_like_category(cand_text):
                         continue
-                    if looks_like_category(cand_text):
-                        continue
-                    reject_terms = [
-                        "risk register", "risk description", "risk definition", "risk category",
-                        "impact", "likelihood", "inherent risk", "controls", "owner", "cause",
-                        "objective", "updated",
-                    ]
+                    reject_terms = ["risk register", "risk description", "risk definition", "risk category",
+                                    "impact", "likelihood", "inherent risk", "controls", "owner", "cause",
+                                    "objective", "updated"]
                     if any(term in cand_text.lower() for term in reject_terms):
                         continue
                     return {"division": cand_text, "confidence": 0.95, "source": "explicit_cell"}
@@ -311,72 +291,42 @@ def detect_explicit_division(ws, header_row: Optional[int] = None, scan_cols: in
 def get_division_for_risk(file_name: str, sheet_name: str, explicit: Optional[Dict[str, Any]]) -> Tuple[str, str, float]:
     if explicit:
         return explicit["division"], explicit["source"], explicit["confidence"]
-
     inferred = infer_division_from_filename(file_name)
     if inferred["confidence"] > 0:
         return inferred["division"], inferred["source"], inferred["confidence"]
-
     clean_sheet = re.sub(r"(?i)\brisk\s*register\b", "", sheet_name).strip()
     clean_sheet = re.sub(r"[_\-\s]+", " ", clean_sheet).strip()
     if clean_sheet and not is_year_like(clean_sheet) and len(clean_sheet) >= 2:
         return clean_sheet.title(), "sheet_name", 0.60
-
     return "Unknown Division", "fallback", 0.0
 
 # =============================================================================
-# VALID CATEGORIES
+# VALID CATEGORIES & INFERENCE
 # =============================================================================
-VALID_CATEGORIES = {
-    "strategic",
-    "financial",
-    "operational",
-    "compliance/legal",
-    "people/hr",
-    "ict/cyber",
-    "reputational",
-    "health/safety",
-    "environmental",
-}
+VALID_CATEGORIES = {"strategic", "financial", "operational", "compliance/legal", "people/hr",
+                    "ict/cyber", "reputational", "health/safety", "environmental"}
 
 def normalize_category_value(val: str) -> str:
     raw = normalize_text(val).strip()
     if not raw:
         return ""
-
     raw_lower = raw.lower()
-
-    aliases = {
-        "hr": "People/HR",
-        "human resources": "People/HR",
-        "compliance": "Compliance/Legal",
-        "legal": "Compliance/Legal",
-        "ict": "ICT/Cyber",
-        "it": "ICT/Cyber",
-        "cyber": "ICT/Cyber",
-        "health and safety": "Health/Safety",
-        "strategic": "Strategic",
-        "financial": "Financial",
-        "operational": "Operational",
-        "reputational": "Reputational",
-        "environmental": "Environmental",
-    }
-
+    aliases = {"hr": "People/HR", "human resources": "People/HR", "compliance": "Compliance/Legal",
+               "legal": "Compliance/Legal", "ict": "ICT/Cyber", "it": "ICT/Cyber", "cyber": "ICT/Cyber",
+               "health and safety": "Health/Safety", "strategic": "Strategic", "financial": "Financial",
+               "operational": "Operational", "reputational": "Reputational", "environmental": "Environmental"}
     if raw_lower in aliases:
         return aliases[raw_lower]
-
     for valid in VALID_CATEGORIES:
         if raw_lower == valid:
             return valid.title()
-
     return ""
 
 def infer_category_from_text(title: str, statement: str, cause: str, raw_category: str = "") -> str:
     normalized_raw = normalize_category_value(raw_category)
     if normalized_raw:
         return normalized_raw
-
     combined = " ".join([normalize_text(title), normalize_text(statement), normalize_text(cause)]).lower()
-
     if any(term in combined for term in ["compliance", "regulation", "labour law", "employment act", "legal"]):
         return "Compliance/Legal"
     if any(term in combined for term in ["staff", "talent", "retention", "morale", "employee", "recruit", "succession", "turnover", "hr"]):
@@ -418,26 +368,21 @@ FIELD_PATTERNS: Dict[str, List[str]] = {
 
 def is_helper_sheet(sheet_name: str) -> bool:
     s = sheet_name.lower()
-    helper_keywords = [
-        "boundary", "impact", "likelihood", "effectiveness", "matrix", "lookup",
-        "legend", "instruction", "guide", "dashboard", "heatmap", "chart", "pivot",
-    ]
+    helper_keywords = ["boundary", "impact", "likelihood", "effectiveness", "matrix", "lookup",
+                       "legend", "instruction", "guide", "dashboard", "heatmap", "chart", "pivot"]
     return any(word in s for word in helper_keywords)
 
 def detect_header_row_and_columns(ws, scan_rows: int = 30, max_cols: int = 50) -> Tuple[Optional[int], Dict[str, int], int]:
     best_row = None
     best_map: Dict[str, int] = {}
     best_score = 0
-
     for row_idx in range(1, min(scan_rows, ws.max_row) + 1):
         current_map: Dict[str, int] = {}
         score = 0
-
         for col_idx in range(1, min(max_cols, ws.max_column) + 1):
             val = normalize_text(merged_cell_value(ws, row_idx, col_idx)).lower()
             if not val:
                 continue
-
             for field, patterns in FIELD_PATTERNS.items():
                 if field in current_map:
                     continue
@@ -445,21 +390,17 @@ def detect_header_row_and_columns(ws, scan_rows: int = 30, max_cols: int = 50) -
                     current_map[field] = col_idx
                     score += 1
                     break
-
         if score > best_score and ("risk_name" in current_map or "risk_statement" in current_map):
             best_row = row_idx
             best_map = current_map
             best_score = score
-
     return best_row, best_map, best_score
 
 def rank_candidate_sheets(wb) -> List[Dict[str, Any]]:
-    candidates: List[Dict[str, Any]] = []
-
+    candidates = []
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         header_row, col_map, score = detect_header_row_and_columns(ws)
-
         name_bonus = 0
         lower_name = sheet_name.lower()
         if "risk" in lower_name:
@@ -472,41 +413,30 @@ def rank_candidate_sheets(wb) -> List[Dict[str, Any]]:
             name_bonus += 2
         if is_helper_sheet(sheet_name):
             name_bonus -= 4
-
         total_score = score + name_bonus
-
-        candidates.append({
-            "sheet_name": sheet_name,
-            "header_row": header_row,
-            "column_map": col_map,
-            "header_score": score,
-            "total_score": total_score,
-        })
-
+        candidates.append({"sheet_name": sheet_name, "header_row": header_row, "column_map": col_map,
+                           "header_score": score, "total_score": total_score})
     candidates.sort(key=lambda x: x["total_score"], reverse=True)
     return candidates
 
 # =============================================================================
-# ROW ACCEPTANCE SCORING (unchanged)
+# ROW ACCEPTANCE SCORING & PARSING (unchanged)
 # =============================================================================
 def is_valid_risk_record(row: Dict[str, Any]) -> Tuple[bool, int, str]:
     evidence = 0
     reasons = []
-
     if row.get("risk_name") and len(row["risk_name"]) > 3:
         evidence += 3
         reasons.append("has_risk_name")
     else:
         reasons.append("missing_risk_name")
         return False, evidence, " | ".join(reasons)
-
     if row.get("risk_statement") and len(row["risk_statement"]) > 20:
         evidence += 3
         reasons.append("has_risk_statement")
     else:
         reasons.append("missing_or_short_statement")
         return False, evidence, " | ".join(reasons)
-
     if row.get("cause"):
         evidence += 1
         reasons.append("has_cause")
@@ -528,7 +458,6 @@ def is_valid_risk_record(row: Dict[str, Any]) -> Tuple[bool, int, str]:
     if row.get("treatment_plan"):
         evidence += 1
         reasons.append("has_treatment")
-
     is_valid = evidence >= 6
     reason_str = " | ".join(reasons)
     return is_valid, evidence, reason_str
@@ -537,11 +466,7 @@ def looks_like_continuation_fragment(text: str) -> bool:
     if not text:
         return False
     t = text.strip()
-    if re.match(r"^\d+\.\s+", t):
-        return True
-    if t.startswith("- ") or t.startswith("• "):
-        return True
-    if t and t[0].islower():
+    if re.match(r"^\d+\.\s+", t) or t.startswith("- ") or t.startswith("• ") or (t and t[0].islower()):
         return True
     return False
 
@@ -554,7 +479,6 @@ def merge_continuation_rows(rows: List[Dict]) -> List[Dict]:
             if current:
                 current["risk_statement"] += " " + stmt
             continue
-
         if row.get("risk_name") or row.get("risk_statement"):
             if current:
                 merged.append(current)
@@ -577,19 +501,15 @@ def parse_risk_score(val: Any) -> Optional[float]:
             return None
     except Exception:
         pass
-
     s = normalize_text(val).lower()
     if s in {"#n/a", "#value!", "#ref!", "#name?", "#num!", "#null!", "none", "nan", ""}:
         return None
-
     impact_map = {"critical": 5, "major": 4, "moderate": 3, "significant": 2, "minor": 1}
     likelihood_map = {"almost certain": 5, "likely": 4, "moderate": 3, "unlikely": 2, "rare": 1}
-
     if s in impact_map:
         return float(impact_map[s])
     if s in likelihood_map:
         return float(likelihood_map[s])
-
     match = re.search(r"(\d+(?:\.\d+)?)", s)
     if match:
         num = float(match.group(1))
@@ -605,21 +525,12 @@ def parse_control_effectiveness(val: Any) -> Optional[float]:
             return None
     except Exception:
         pass
-
     s = normalize_text(val).lower()
-    mapping = {
-        "very good": 0.8,
-        "good": 0.6,
-        "satisfactory": 0.4,
-        "moderate": 0.4,
-        "weak": 0.2,
-        "unsatisfactory": 0.1,
-        "ineffective": 0.1,
-    }
+    mapping = {"very good": 0.8, "good": 0.6, "satisfactory": 0.4, "moderate": 0.4,
+               "weak": 0.2, "unsatisfactory": 0.1, "ineffective": 0.1}
     for key, num in mapping.items():
         if key in s:
             return num
-
     match = re.search(r"(\d+(?:\.\d+)?)", s)
     if match:
         num = float(match.group(1))
@@ -629,48 +540,21 @@ def parse_control_effectiveness(val: Any) -> Optional[float]:
             return (num - 1) / 4.0
     return None
 
-def compute_scores(
-    raw_impact: Any,
-    raw_likelihood: Any,
-    raw_control_effectiveness: Any
-) -> Tuple[int, int, float, float, Optional[float], str]:
-    impact_score = parse_risk_score(raw_impact)
-    likelihood_score = parse_risk_score(raw_likelihood)
-
-    # Default to 3 if missing
-    if impact_score is None:
-        impact_score = 3.0
-    if likelihood_score is None:
-        likelihood_score = 3.0
-
+def compute_scores(raw_impact: Any, raw_likelihood: Any, raw_control_effectiveness: Any) -> Tuple[int, int, float, float, Optional[float], str]:
+    impact_score = parse_risk_score(raw_impact) or 3.0
+    likelihood_score = parse_risk_score(raw_likelihood) or 3.0
     control_eff_factor = parse_control_effectiveness(raw_control_effectiveness)
     control_eff_text = normalize_text(raw_control_effectiveness) or "Not rated"
-
-    # INHERENT = IMPACT × LIKELIHOOD
     inherent = round(impact_score * likelihood_score)
     inherent = min(25, max(1, inherent))
-
-    # RESIDUAL = INHERENT × (1 − CONTROL EFFECTIVENESS)
-    if control_eff_factor is not None:
-        residual = round(inherent * (1.0 - control_eff_factor))
-    else:
-        residual = inherent
-
+    residual = round(inherent * (1.0 - control_eff_factor)) if control_eff_factor is not None else inherent
     residual = min(25, max(1, residual))
-
     return residual, inherent, impact_score, likelihood_score, control_eff_factor, control_eff_text
 
-def parse_structured_sheet(
-    ws,
-    sheet_name: str,
-    col_map: Dict[str, int],
-    header_row: int,
-    file_name: str,
-    default_residual: int
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    raw_rows: List[Dict[str, Any]] = []
-    row_audit: List[Dict[str, Any]] = []
-
+def parse_structured_sheet(ws, sheet_name: str, col_map: Dict[str, int], header_row: int,
+                           file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    raw_rows = []
+    row_audit = []
     explicit = detect_explicit_division(ws, header_row=header_row)
     division_name, division_source, division_conf = get_division_for_risk(file_name, sheet_name, explicit)
 
@@ -682,7 +566,6 @@ def parse_structured_sheet(
 
     blank_streak = 0
     start_row = header_row + 1
-
     for row_idx in range(start_row, min(ws.max_row + 1, start_row + 300)):
         raw_risk_no = get_field(row_idx, "risk_no")
         raw_objective = get_field(row_idx, "objective")
@@ -720,63 +603,32 @@ def parse_structured_sheet(
                 break
             continue
         blank_streak = 0
-
         lower_gate = combined_gate.lower()
-        metadata_indicators = [
-            "risk description", "risk definition", "link to objective", "control effectiveness",
-            "treatment due date", "risk strategy", "risk owner", "impact (1-5)", "likelihood score",
-            "inherent risk", "residual risk", "division/dept", "what is in place to prevent",
-        ]
+        metadata_indicators = ["risk description", "risk definition", "link to objective", "control effectiveness",
+                               "treatment due date", "risk strategy", "risk owner", "impact (1-5)", "likelihood score",
+                               "inherent risk", "residual risk", "division/dept", "what is in place to prevent"]
         if any(ind in lower_gate for ind in metadata_indicators):
             continue
-
         if risk_name.startswith("=") or risk_statement.startswith("="):
             continue
 
         residual, inherent, impact_score, likelihood_score, control_eff_factor, control_eff_text = compute_scores(
-            raw_impact=raw_impact_text,
-            raw_likelihood=raw_likelihood_text,
-            raw_control_effectiveness=raw_control_eff
-        )
-
+            raw_impact_text, raw_likelihood_text, raw_control_eff)
         parsed_due_date = parse_due_date(raw_due_date)
-        category = infer_category_from_text(
-            title=risk_name,
-            statement=risk_statement,
-            cause=cause,
-            raw_category=category_raw,
-        )
+        category = infer_category_from_text(risk_name, risk_statement, cause, category_raw)
 
         raw_rows.append({
-            "division": division_name,
-            "division_source": division_source,
-            "division_confidence": division_conf,
-            "risk_no": risk_no,
-            "objective_link": objective,
-            "risk_name": risk_name,
-            "risk_statement": risk_statement,
-            "cause": cause,
-            "category": category,
-            "inherent_score": inherent,
-            "residual_score": residual,
-            "impact_score": impact_score,
-            "likelihood_score": likelihood_score,
-            "owner": owner or "Not assigned",
-            "status": status,
-            "due_date": parsed_due_date,
-            "due_date_raw": due_date_raw,
-            "controls": controls,
-            "control_effectiveness": control_eff_text,
-            "control_effectiveness_factor": control_eff_factor,
-            "strategy": strategy,
-            "treatment_plan": treatment,
-            "source_file": file_name,
-            "source_sheet": sheet_name,
-            "source_row": row_idx,
+            "division": division_name, "division_source": division_source, "division_confidence": division_conf,
+            "risk_no": risk_no, "objective_link": objective, "risk_name": risk_name, "risk_statement": risk_statement,
+            "cause": cause, "category": category, "inherent_score": inherent, "residual_score": residual,
+            "impact_score": impact_score, "likelihood_score": likelihood_score, "owner": owner or "Not assigned",
+            "status": status, "due_date": parsed_due_date, "due_date_raw": due_date_raw, "controls": controls,
+            "control_effectiveness": control_eff_text, "control_effectiveness_factor": control_eff_factor,
+            "strategy": strategy, "treatment_plan": treatment, "source_file": file_name, "source_sheet": sheet_name,
+            "source_row": row_idx
         })
 
     raw_rows = merge_continuation_rows(raw_rows)
-
     accepted_risks = []
     for row in raw_rows:
         is_valid, confidence, reason = is_valid_risk_record(row)
@@ -785,171 +637,84 @@ def parse_structured_sheet(
             row["acceptance_reason"] = reason
             row["parser_confidence"] = 0.95
             accepted_risks.append(row)
-            row_audit.append({
-                "row": row["source_row"],
-                "risk_name": row["risk_name"],
-                "status": "accepted",
-                "confidence": confidence,
-                "reason": reason,
-            })
+            row_audit.append({"row": row["source_row"], "risk_name": row["risk_name"], "status": "accepted",
+                              "confidence": confidence, "reason": reason})
         else:
-            row_audit.append({
-                "row": row["source_row"],
-                "risk_name": row["risk_name"],
-                "status": "rejected",
-                "confidence": confidence,
-                "reason": reason,
-            })
+            row_audit.append({"row": row["source_row"], "risk_name": row["risk_name"], "status": "rejected",
+                              "confidence": confidence, "reason": reason})
 
-    debug = {
-        "sheet_used": sheet_name,
-        "header_row": header_row,
-        "column_map": col_map,
-        "rows_scanned": len(raw_rows) + len(row_audit) - len(accepted_risks),
-        "rows_accepted": len(accepted_risks),
-        "acceptance_rate": round(len(accepted_risks) / max(1, len(raw_rows)) * 100, 1),
-        "row_audit_preview": row_audit[:100],
-    }
-
+    debug = {"sheet_used": sheet_name, "header_row": header_row, "column_map": col_map,
+             "rows_scanned": len(raw_rows) + len(row_audit) - len(accepted_risks),
+             "rows_accepted": len(accepted_risks),
+             "acceptance_rate": round(len(accepted_risks) / max(1, len(raw_rows)) * 100, 1),
+             "row_audit_preview": row_audit[:100]}
     return pd.DataFrame(accepted_risks), debug
 
-# =============================================================================
-# UNIVERSAL PARSER ENTRY POINT (unchanged)
-# =============================================================================
-def parse_structured_risk_register(
-    file_bytes: bytes,
-    file_name: str,
-    default_residual: int
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    debug_info: Dict[str, Any] = {
-        "parser": "intelligent_structured_v14",
-        "candidate_sheets": [],
-        "selected_sheets": [],
-        "error": None,
-    }
-
+def parse_structured_risk_register(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    debug_info = {"parser": "intelligent_structured_v14", "candidate_sheets": [], "selected_sheets": [], "error": None}
     try:
         wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
-
         candidates = rank_candidate_sheets(wb)
         debug_info["candidate_sheets"] = candidates[:10]
-
-        strong_candidates = [
-            c for c in candidates
-            if c["header_row"] is not None
-            and c["header_score"] >= 5
-            and "risk_name" in c["column_map"]
-            and "risk_statement" in c["column_map"]
-            and "impact_text" in c["column_map"]
-            and "likelihood_text" in c["column_map"]
-        ]
-
+        strong_candidates = [c for c in candidates if c["header_row"] is not None and c["header_score"] >= 5
+                             and "risk_name" in c["column_map"] and "risk_statement" in c["column_map"]
+                             and "impact_text" in c["column_map"] and "likelihood_text" in c["column_map"]]
         if not strong_candidates:
-            strong_candidates = [
-                c for c in candidates
-                if c["header_row"] is not None
-                and c["header_score"] >= 4
-                and "risk_name" in c["column_map"]
-                and ("risk_statement" in c["column_map"] or "cause" in c["column_map"])
-            ]
-
+            strong_candidates = [c for c in candidates if c["header_row"] is not None and c["header_score"] >= 4
+                                 and "risk_name" in c["column_map"]
+                                 and ("risk_statement" in c["column_map"] or "cause" in c["column_map"])]
         if not strong_candidates:
             debug_info["error"] = "No structured risk register sheet detected"
             return pd.DataFrame(), debug_info
-
         best = strong_candidates[0]
         debug_info["selected_sheets"] = [best["sheet_name"]]
-
         ws = wb[best["sheet_name"]]
-        df_sheet, parse_debug = parse_structured_sheet(
-            ws=ws,
-            sheet_name=best["sheet_name"],
-            col_map=best["column_map"],
-            header_row=best["header_row"],
-            file_name=file_name,
-            default_residual=default_residual,
-        )
+        df_sheet, parse_debug = parse_structured_sheet(ws, best["sheet_name"], best["column_map"],
+                                                       best["header_row"], file_name, default_residual)
         debug_info.update(parse_debug)
-
         if not df_sheet.empty:
             return df_sheet, debug_info
-
         debug_info["error"] = "No valid risks parsed after acceptance scoring"
         return pd.DataFrame(), debug_info
-
     except Exception as exc:
         debug_info["error"] = str(exc)
         return pd.DataFrame(), debug_info
 
-# =============================================================================
-# SIMPLE FALLBACK PARSER (unchanged)
-# =============================================================================
-def simple_fallback_parser(
-    file_bytes: bytes,
-    file_name: str,
-    default_residual: int
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    risks: List[Dict[str, Any]] = []
-    debug_info: Dict[str, Any] = {"parser": "simple_fallback", "cells_scanned": 0, "risks_found": 0}
-
+def simple_fallback_parser(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    risks = []
+    debug_info = {"parser": "simple_fallback", "cells_scanned": 0, "risks_found": 0}
     try:
         wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
-
         for sheet_name in wb.sheetnames:
             if is_helper_sheet(sheet_name):
                 continue
-
             ws = wb[sheet_name]
-
             for row_idx in range(1, min(ws.max_row + 1, 200)):
                 for col_idx in range(1, min(ws.max_column + 1, 30)):
                     val = merged_cell_value(ws, row_idx, col_idx)
                     debug_info["cells_scanned"] += 1
-
                     if isinstance(val, str):
                         text = normalize_text(val)
                         if len(text) > 40 and not text.startswith("="):
-                            metadata_indicators = [
-                                "risk monitoring", "period of assessment", "department/ unit",
-                                "description of control", "overall effectiveness", "control categorisation",
-                                "action plan", "residual risk", "risk strategy", "inherent risk",
-                                "risk owner", "impact rating", "likelihood rating", "root cause",
-                                "consequences", "start date", "target completion", "processed by",
-                                "approved by", "recommended by", "signature", "link to objective",
-                                "risk no", "division/ dept",
-                            ]
+                            metadata_indicators = ["risk monitoring", "period of assessment", "department/ unit",
+                                                   "description of control", "overall effectiveness", "control categorisation",
+                                                   "action plan", "residual risk", "risk strategy", "inherent risk",
+                                                   "risk owner", "impact rating", "likelihood rating", "root cause",
+                                                   "consequences", "start date", "target completion", "processed by",
+                                                   "approved by", "recommended by", "signature", "link to objective",
+                                                   "risk no", "division/ dept"]
                             if not any(ind in text.lower() for ind in metadata_indicators):
                                 division_name, division_source, division_conf = get_division_for_risk(file_name, sheet_name, None)
                                 impact = 3.0
                                 likelihood = 3.0
                                 inherent = round(impact * likelihood)
-                                row = {
-                                    "division": division_name,
-                                    "division_source": division_source,
-                                    "division_confidence": division_conf,
-                                    "risk_no": "",
-                                    "objective_link": "",
-                                    "risk_name": text[:80],
-                                    "risk_statement": text[:500],
-                                    "cause": "",
-                                    "category": "Uncategorised",
-                                    "inherent_score": inherent,
-                                    "residual_score": inherent,
-                                    "impact_score": impact,
-                                    "likelihood_score": likelihood,
-                                    "owner": "Not assigned",
-                                    "status": "Active",
-                                    "due_date": None,
-                                    "due_date_raw": "",
-                                    "controls": "",
-                                    "control_effectiveness": "Not rated",
-                                    "control_effectiveness_factor": None,
-                                    "strategy": "Treat",
-                                    "treatment_plan": "",
-                                    "source_file": file_name,
-                                    "source_sheet": sheet_name,
-                                    "source_row": row_idx,
-                                }
+                                row = {"division": division_name, "division_source": division_source, "division_confidence": division_conf,
+                                       "risk_no": "", "objective_link": "", "risk_name": text[:80], "risk_statement": text[:500],
+                                       "cause": "", "category": "Uncategorised", "inherent_score": inherent, "residual_score": inherent,
+                                       "impact_score": impact, "likelihood_score": likelihood, "owner": "Not assigned", "status": "Active",
+                                       "due_date": None, "due_date_raw": "", "controls": "", "control_effectiveness": "Not rated",
+                                       "control_effectiveness_factor": None, "strategy": "Treat", "treatment_plan": "",
+                                       "source_file": file_name, "source_sheet": sheet_name, "source_row": row_idx}
                                 is_valid, conf, reason = is_valid_risk_record(row)
                                 if is_valid:
                                     row["acceptance_score"] = conf
@@ -963,32 +728,21 @@ def simple_fallback_parser(
                     break
             if len(risks) >= 20:
                 break
-
     except Exception as exc:
         debug_info["error"] = str(exc)
-
     if risks:
         return pd.DataFrame(risks), debug_info
     return pd.DataFrame(), debug_info
 
-# =============================================================================
-# FINAL DISPATCHER (unchanged)
-# =============================================================================
-def parse_uploaded_file_bytes(
-    file_bytes: bytes,
-    file_name: str,
-    default_residual: int
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def parse_uploaded_file_bytes(file_bytes: bytes, file_name: str, default_residual: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     df, debug = parse_structured_risk_register(file_bytes, file_name, default_residual)
     if not df.empty:
         st.success(f"✅ Extracted {len(df)} risks (acceptance rate {debug.get('acceptance_rate', 0)}%)")
         return df, debug
-
     df, fallback_debug = simple_fallback_parser(file_bytes, file_name, default_residual)
     if not df.empty:
         st.warning(f"⚠️ Simple fallback extracted {len(df)} potential risks")
         return df, fallback_debug
-
     return pd.DataFrame(), debug
 
 # =============================================================================
@@ -997,13 +751,11 @@ def parse_uploaded_file_bytes(
 def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if raw_df.empty:
         return pd.DataFrame(), pd.DataFrame()
-
     def safe_col(col_name, default_val=None):
         if col_name in raw_df.columns:
             return raw_df[col_name].fillna(default_val).tolist()
         else:
             return [default_val] * len(raw_df)
-
     statements = safe_col("risk_statement", "")
     names = safe_col("risk_name", "")
     divisions = safe_col("division", "Unknown Division")
@@ -1029,7 +781,6 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
 
     clusters = []
     used = set()
-
     for i, stmt in enumerate(statements):
         if i in used:
             continue
@@ -1046,7 +797,6 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
 
     enterprise_rows = []
     clusters_detail = []
-
     for cluster_id, (indices, similarities) in enumerate(clusters):
         cluster_names = [names[idx] for idx in indices]
         cluster_stmts = [statements[idx] for idx in indices]
@@ -1067,32 +817,19 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         cluster_acceptance = [acceptance_scores[idx] for idx in indices]
         cluster_parser_conf = [parser_confidences[idx] for idx in indices]
         cluster_div_conf = [division_confidences[idx] for idx in indices]
-        cluster_sources = [
-            f"{source_files[idx]}:{source_sheets[idx]}:row{source_rows[idx]}"
-            for idx in indices
-        ]
+        cluster_sources = [f"{source_files[idx]}:{source_sheets[idx]}:row{source_rows[idx]}" for idx in indices]
 
         avg_similarity = sum(similarities) / len(similarities) if similarities else 0
         acceptance_avg = sum(cluster_acceptance) / len(cluster_acceptance) if cluster_acceptance else 0
         parser_conf_avg = sum(cluster_parser_conf) / len(cluster_parser_conf) if cluster_parser_conf else 0
         div_conf_avg = sum(cluster_div_conf) / len(cluster_div_conf) if cluster_div_conf else 0
-
         unique_divs = set(cluster_divisions)
         div_consistency = 1.0 if len(unique_divs) == 1 else 0.6 if len(unique_divs) <= 2 else 0.3
         unique_cats = set(cluster_categories)
         cat_consistency = 1.0 if len(unique_cats) == 1 else 0.7 if len(unique_cats) <= 2 else 0.4
-
-        cluster_confidence = (
-            (avg_similarity / 100) * 0.30 +
-            (acceptance_avg / 10) * 0.20 +
-            (parser_conf_avg) * 0.15 +
-            (div_conf_avg) * 0.10 +
-            (len(indices) / 5) * 0.10 +
-            div_consistency * 0.10 +
-            cat_consistency * 0.05
-        ) * 100
+        cluster_confidence = ((avg_similarity / 100) * 0.30 + (acceptance_avg / 10) * 0.20 + parser_conf_avg * 0.15 +
+                              div_conf_avg * 0.10 + (len(indices) / 5) * 0.10 + div_consistency * 0.10 + cat_consistency * 0.05) * 100
         cluster_confidence = round(min(100, cluster_confidence))
-
         canonical_name = max(cluster_names, key=len) if cluster_names else "Unnamed Risk"
         canonical_stmt = max(cluster_stmts, key=len) if cluster_stmts else ""
         div_counts = pd.Series(cluster_divisions).value_counts()
@@ -1106,15 +843,12 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         all_owners = ", ".join(sorted(set(o for o in cluster_owners if o.lower() != "not assigned"))) or "Not assigned"
         primary_owner = cluster_owners[0] if cluster_owners else "Not assigned"
         all_divisions_str = ", ".join(sorted(unique_divs))
-
         primary_controls = max([c for c in cluster_controls if c], key=len) if any(cluster_controls) else ""
         all_controls = " | ".join(sorted(set(c for c in cluster_controls if c)))
         avg_control_eff = round(sum(cluster_control_eff_factor) / len(cluster_control_eff_factor), 2) if cluster_control_eff_factor else None
         worst_control_eff = max(cluster_control_eff_factor) if cluster_control_eff_factor else None
         worst_control_text = cluster_control_eff_text[cluster_control_eff_factor.index(worst_control_eff)] if worst_control_eff in cluster_control_eff_factor else "Not rated"
-
         mitigation_strength = round((max_inherent - max_residual) / max_inherent * 100, 1) if max_inherent > 0 else 0.0
-
         strategy_counts = pd.Series([s for s in cluster_strategies if s]).value_counts()
         primary_strategy = strategy_counts.index[0] if not strategy_counts.empty else "Treat"
         all_strategies = ", ".join(sorted(set(s for s in cluster_strategies if s)))
@@ -1134,54 +868,28 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
             treatment_status = "Mixed"
 
         enterprise_rows.append({
-            "enterprise_risk_id": f"ER-{cluster_id+1:03d}",
-            "risk_name": canonical_name,
-            "risk_statement": canonical_stmt,
-            "primary_division": primary_division,
-            "all_contributing_divisions": all_divisions_str,
-            "primary_category": primary_category,
-            "all_categories": ", ".join(sorted(unique_cats)),
-            "inherent_score": max_inherent,
-            "residual_score": max_residual,
-            "impact_pre": avg_impact,
-            "likelihood_pre": avg_likelihood,
-            "primary_owner": primary_owner,
-            "all_owners": all_owners,
-            "primary_strategy": primary_strategy,
-            "all_strategies": all_strategies,
-            "primary_treatment_plan": primary_treatment,
-            "all_treatment_plans": all_treatments,
-            "earliest_due_date": earliest_due,
-            "latest_due_date": latest_due,
-            "treatment_status": treatment_status,
-            "primary_controls": primary_controls,
-            "all_controls": all_controls,
-            "control_effectiveness": worst_control_text,
-            "control_effectiveness_factor": worst_control_eff,
-            "avg_control_effectiveness": avg_control_eff,
-            "mitigation_strength_pct": mitigation_strength,
-            "cluster_size": len(indices),
-            "cluster_confidence": cluster_confidence,
-            "source_risks": cluster_names,
-            "source_lineage": " | ".join(cluster_sources[:3]) + ("..." if len(cluster_sources) > 3 else ""),
+            "enterprise_risk_id": f"ER-{cluster_id+1:03d}", "risk_name": canonical_name, "risk_statement": canonical_stmt,
+            "primary_division": primary_division, "all_contributing_divisions": all_divisions_str,
+            "primary_category": primary_category, "all_categories": ", ".join(sorted(unique_cats)),
+            "inherent_score": max_inherent, "residual_score": max_residual, "impact_pre": avg_impact, "likelihood_pre": avg_likelihood,
+            "primary_owner": primary_owner, "all_owners": all_owners, "primary_strategy": primary_strategy, "all_strategies": all_strategies,
+            "primary_treatment_plan": primary_treatment, "all_treatment_plans": all_treatments, "earliest_due_date": earliest_due,
+            "latest_due_date": latest_due, "treatment_status": treatment_status, "primary_controls": primary_controls,
+            "all_controls": all_controls, "control_effectiveness": worst_control_text, "control_effectiveness_factor": worst_control_eff,
+            "avg_control_effectiveness": avg_control_eff, "mitigation_strength_pct": mitigation_strength,
+            "cluster_size": len(indices), "cluster_confidence": cluster_confidence, "source_risks": cluster_names,
+            "source_lineage": " | ".join(cluster_sources[:3]) + ("..." if len(cluster_sources) > 3 else "")
         })
-
         clusters_detail.append({
-            "cluster_id": f"ER-{cluster_id+1:03d}",
-            "cluster_size": len(indices),
-            "avg_similarity": round(avg_similarity, 1),
-            "cluster_confidence": cluster_confidence,
-            "primary_division": primary_division,
-            "all_divisions": all_divisions_str,
-            "primary_category": primary_category,
-            "mitigation_strength": mitigation_strength,
-            "canonical_name": canonical_name,
+            "cluster_id": f"ER-{cluster_id+1:03d}", "cluster_size": len(indices), "avg_similarity": round(avg_similarity, 1),
+            "cluster_confidence": cluster_confidence, "primary_division": primary_division, "all_divisions": all_divisions_str,
+            "primary_category": primary_category, "mitigation_strength": mitigation_strength, "canonical_name": canonical_name
         })
 
     enterprise_df = pd.DataFrame(enterprise_rows)
     if not enterprise_df.empty:
         enterprise_df["residual_level"] = enterprise_df["residual_score"].apply(
-            lambda x: "Critical" if x >= 20 else "High" if x >= 12 else "Medium" if x >= 6 else "Low"
+            lambda x: "Critical" if x >= 20 else "High" if x >= 15 else "Medium" if x >= 5 else "Low"
         )
     clusters_detail_df = pd.DataFrame(clusters_detail)
     return enterprise_df, clusters_detail_df
@@ -1191,7 +899,6 @@ def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[p
     all_debug = []
     total_scanned = 0
     total_accepted = 0
-
     for file in uploaded_files:
         df, debug = cached_parse_file(file.getvalue(), file.name, default_residual)
         all_debug.append(debug)
@@ -1199,33 +906,24 @@ def parse_all_files(uploaded_files, tier: str, default_residual: int) -> Tuple[p
         total_accepted += len(df)
         if not df.empty:
             all_raw.append(df)
-
     if not all_raw:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), all_debug
-
     raw_df = pd.concat(all_raw, ignore_index=True)
     raw_df["_stmt_norm"] = raw_df["risk_statement"].fillna("").apply(lambda x: re.sub(r"[^\w\s]", "", x.lower()).strip())
     raw_df = raw_df.drop_duplicates(subset=["_stmt_norm"], keep="first")
     raw_df = raw_df.drop(columns=["_stmt_norm"])
-
     enterprise_df, clusters_detail_df = build_enterprise_register(raw_df)
-
     if tier == "free":
         raw_df = raw_df.head(10)
         enterprise_df = enterprise_df.head(10)
         clusters_detail_df = clusters_detail_df.head(10)
-
     st.session_state.parser_audit = {
-        "total_files": len(uploaded_files),
-        "raw_risks": len(raw_df),
-        "enterprise_risks": len(enterprise_df),
-        "rows_scanned": total_scanned,
-        "rows_accepted": total_accepted,
+        "total_files": len(uploaded_files), "raw_risks": len(raw_df), "enterprise_risks": len(enterprise_df),
+        "rows_scanned": total_scanned, "rows_accepted": total_accepted,
         "acceptance_rate": round(total_accepted / max(1, total_scanned) * 100, 1),
         "clusters_formed": len(enterprise_df),
-        "low_confidence_clusters": len(clusters_detail_df[clusters_detail_df["cluster_confidence"] < 60]) if not clusters_detail_df.empty else 0,
+        "low_confidence_clusters": len(clusters_detail_df[clusters_detail_df["cluster_confidence"] < 60]) if not clusters_detail_df.empty else 0
     }
-
     return raw_df, enterprise_df, clusters_detail_df, all_debug
 
 # =============================================================================
@@ -1245,42 +943,27 @@ def appetite_band(score: float, threshold: int, category: str = "", category_app
     return "within appetite"
 
 def calculate_enterprise_health_score(df: pd.DataFrame) -> float:
-    """
-    Calculate a realistic enterprise health score based on configurable weights.
-    Uses global HEALTH_WEIGHTS dictionary.
-    """
     if df.empty:
         return 0.0
-
-    # 1. Residual exposure burden (weighted)
     critical_high_ratio = (df["residual_level"].isin(["Critical", "High"])).mean()
-    # Scale: 0% critical/high -> 100, 100% -> 0
     exposure_score = (1 - critical_high_ratio) * 100
-
-    # 2. Control effectiveness (weighted)
     if "avg_control_effectiveness" in df.columns and df["avg_control_effectiveness"].notna().any():
         avg_control = df["avg_control_effectiveness"].mean()
     else:
         avg_control = df["mitigation_strength_pct"].mean() / 100
     control_score = avg_control * 100
-
-    # 3. Treatment confidence (weighted)
     if "treatment_status" in df.columns:
         on_track_ratio = (df["treatment_status"] == "On Track").mean()
         completed_ratio = (df["treatment_status"] == "Completed").mean()
         treatment_score = (on_track_ratio * 70 + completed_ratio * 100)
     else:
         treatment_score = 50
-
-    # 4. Appetite compliance (weighted)
     if "appetite_band" in df.columns:
         within_ratio = (df["appetite_band"] == "within appetite").mean()
         near_ratio = (df["appetite_band"] == "near appetite").mean()
         appetite_score = (within_ratio * 100 + near_ratio * 50)
     else:
         appetite_score = 50
-
-    # 5. Concentration penalty (reduces final score)
     div_exposure = df.groupby("primary_division")["residual_score"].sum()
     if not div_exposure.empty:
         top_div_pct = div_exposure.max() / div_exposure.sum()
@@ -1290,15 +973,9 @@ def calculate_enterprise_health_score(df: pd.DataFrame) -> float:
             penalty = 0
     else:
         penalty = 0
-
-    # Weighted sum, then subtract penalty
-    final_score = (
-        exposure_score * HEALTH_WEIGHTS["exposure"] +
-        control_score * HEALTH_WEIGHTS["control"] +
-        treatment_score * HEALTH_WEIGHTS["treatment"] +
-        appetite_score * HEALTH_WEIGHTS["appetite"] -
-        penalty * HEALTH_WEIGHTS["concentration_penalty"]
-    )
+    final_score = (exposure_score * HEALTH_WEIGHTS["exposure"] + control_score * HEALTH_WEIGHTS["control"] +
+                   treatment_score * HEALTH_WEIGHTS["treatment"] + appetite_score * HEALTH_WEIGHTS["appetite"] -
+                   penalty * HEALTH_WEIGHTS["concentration_penalty"])
     return max(0.0, round(final_score, 1))
 
 def detect_emerging_themes(df: pd.DataFrame) -> List[str]:
@@ -1380,7 +1057,6 @@ def generate_board_narrative(snapshot: Dict, threshold: int, company: str, repor
     narrative.append(f"**Reporting Period:** Q{((datetime.now().month-1)//3)+1} {datetime.now().year}")
     narrative.append("")
     health = snapshot.get("enterprise_health_score", 0)
-    # Get posture from thresholds
     posture = "Unknown"
     for score_threshold, label in POSTURE_THRESHOLDS:
         if health >= score_threshold:
@@ -1420,7 +1096,7 @@ def generate_board_narrative(snapshot: Dict, threshold: int, company: str, repor
     return "\n".join(narrative)
 
 # =============================================================================
-# EXCEL & PDF EXPORTS (unchanged)
+# EXCEL & PDF EXPORTS (unchanged, but ensure residual_level uses correct bands)
 # =============================================================================
 def style_excel_with_risk_colors(wb):
     level_colors = {
@@ -1513,16 +1189,14 @@ def generate_pdf_board_pack(narrative: str, snapshot: Dict, company: str, report
         story.append(Paragraph("Top Board-Attention Risks", heading_style))
         data = []
         for risk in snapshot["board_risks"][:5]:
-            level = "Critical" if risk["residual_score"] >= 20 else "High" if risk["residual_score"] >= 12 else "Medium" if risk["residual_score"] >= 6 else "Low"
+            level = get_risk_level(risk["residual_score"])
             data.append([risk["risk_name"], risk["division"], f"{risk['residual_score']}/25", risk["owner"], level])
         t = Table([["Risk Name", "Division", "Residual", "Owner", "Level"]] + data, colWidths=[200, 100, 60, 100, 60])
         style = [('BACKGROUND', (0,0), (-1,0), colors.HexColor("#0E365C")), ('TEXTCOLOR', (0,0), (-1,0), colors.white)]
         for i, row in enumerate(data, start=1):
             level = row[4]
-            if level == "Critical":
+            if level == "High":
                 bg = colors.HexColor("#FEE2E2")
-            elif level == "High":
-                bg = colors.HexColor("#FFEDD5")
             elif level == "Medium":
                 bg = colors.HexColor("#FEF3C7")
             else:
@@ -1586,7 +1260,7 @@ def create_treatment_gauge(confidence: float) -> go.Figure:
     return fig
 
 # =============================================================================
-# UI COMPONENTS (unchanged, but posture uses global thresholds)
+# UI COMPONENTS (unchanged)
 # =============================================================================
 def apply_custom_theme(primary: str, secondary: str) -> None:
     st.markdown(f"""
@@ -1773,7 +1447,6 @@ def render_sidebar():
             col_apply, _ = st.columns([1, 2])
             with col_apply:
                 apply_btn = st.button("Apply Code", use_container_width=True)
-
             if apply_btn:
                 if code == PRO_UNLOCK_CODE:
                     st.session_state.tier = "professional"
@@ -2018,12 +1691,7 @@ def main():
 
             IMPACT_MAP = {5: "Critical", 4: "Major", 3: "Moderate", 2: "Significant", 1: "Minor"}
             LIKELIHOOD_MAP = {5: "Almost Certain", 4: "Likely", 3: "Moderate", 2: "Unlikely", 1: "Rare"}
-            INHERENT_LEVEL_MAP = {
-                (20, 25): "High",
-                (12, 19): "High",
-                (6, 11): "Medium",
-                (1, 5): "Low"
-            }
+            INHERENT_LEVEL_MAP = {(20, 25): "High", (12, 19): "High", (6, 11): "Medium", (1, 5): "Low"}
 
             def get_inherent_level(score):
                 for (low, high), label in INHERENT_LEVEL_MAP.items():
@@ -2032,60 +1700,32 @@ def main():
                 return "Unknown"
 
             display_df = enterprise_df.copy()
-
             display_df["impact_text"] = display_df["impact_pre"].apply(lambda x: IMPACT_MAP.get(int(round(x)), "Unknown") if pd.notna(x) else "Unknown")
             display_df["likelihood_text"] = display_df["likelihood_pre"].apply(lambda x: LIKELIHOOD_MAP.get(int(round(x)), "Unknown") if pd.notna(x) else "Unknown")
             display_df["inherent_text"] = display_df["inherent_score"].apply(get_inherent_level)
 
             display_cols = [
-                "enterprise_risk_id",
-                "risk_name",
-                "risk_statement",
-                "primary_division",
-                "primary_category",
-                "impact_text",
-                "impact_pre",
-                "likelihood_text",
-                "likelihood_pre",
-                "inherent_text",
-                "inherent_score",
-                "residual_score",
-                "primary_owner",
-                "primary_strategy",
-                "primary_treatment_plan",
-                "earliest_due_date",
-                "treatment_status",
-                "mitigation_strength_pct",
-                "cluster_confidence",
+                "enterprise_risk_id", "risk_name", "risk_statement", "primary_division", "primary_category",
+                "impact_text", "impact_pre", "likelihood_text", "likelihood_pre", "inherent_text",
+                "inherent_score", "residual_score", "primary_owner", "primary_strategy", "primary_treatment_plan",
+                "earliest_due_date", "treatment_status", "mitigation_strength_pct", "cluster_confidence",
             ]
             display_cols = [c for c in display_cols if c in display_df.columns]
 
             display_df = display_df[display_cols].rename(columns={
-                "enterprise_risk_id": "Risk ID",
-                "risk_name": "Risk Name",
-                "risk_statement": "Risk Statement",
-                "primary_division": "Division",
-                "primary_category": "Category",
-                "impact_text": "IMPACT",
-                "impact_pre": "Impact (1-5)",
-                "likelihood_text": "LIKELIHOOD",
-                "likelihood_pre": "Likelihood (1-5)",
-                "inherent_text": "INHERENT RISK",
-                "inherent_score": "Inherent Score",
-                "residual_score": "Residual Score",
-                "primary_owner": "Owner",
-                "primary_strategy": "Strategy",
-                "primary_treatment_plan": "Treatment Plan",
-                "earliest_due_date": "Due Date",
-                "treatment_status": "Status",
-                "mitigation_strength_pct": "Mitigation %",
+                "enterprise_risk_id": "Risk ID", "risk_name": "Risk Name", "risk_statement": "Risk Statement",
+                "primary_division": "Division", "primary_category": "Category", "impact_text": "IMPACT",
+                "impact_pre": "Impact (1-5)", "likelihood_text": "LIKELIHOOD", "likelihood_pre": "Likelihood (1-5)",
+                "inherent_text": "INHERENT RISK", "inherent_score": "Inherent Score", "residual_score": "Residual Score",
+                "primary_owner": "Owner", "primary_strategy": "Strategy", "primary_treatment_plan": "Treatment Plan",
+                "earliest_due_date": "Due Date", "treatment_status": "Status", "mitigation_strength_pct": "Mitigation %",
                 "cluster_confidence": "Confidence",
             })
 
             threshold = data.get("threshold", st.session_state.board_threshold)
             category_appetite = st.session_state.category_appetite if st.session_state.tier == "enterprise" else {}
 
-            # Build HTML table with improved coloring including dark green for low residual scores
+            # Build HTML table with correct risk matrix colors
             html_table = '<table class="register-table">'
             html_table += '<thead><tr>'
             for col in display_df.columns:
@@ -2094,22 +1734,16 @@ def main():
 
             for _, row in display_df.iterrows():
                 residual_score = row["Residual Score"]
-                # Determine row background based on residual score first (lowest gets dark green)
-                if residual_score <= 5:
-                    row_bg = "#166534"          # dark green
-                elif residual_score <= 8:
-                    row_bg = "#15803d"          # medium-dark green
+                # Row background based on appetite (very light)
+                band = appetite_band(residual_score, threshold, row.get("Category", ""), category_appetite)
+                if band in ["breached", "critical breach"]:
+                    row_bg = "#fee2e2"
+                elif band == "near appetite":
+                    row_bg = "#fef3c7"
+                elif band == "within appetite":
+                    row_bg = "#dcfce7"
                 else:
-                    # fallback to appetite-based colors
-                    band = appetite_band(residual_score, threshold, row.get("Category", ""), category_appetite)
-                    if band in ["breached", "critical breach"]:
-                        row_bg = "#fee2e2"       # light red
-                    elif band == "near appetite":
-                        row_bg = "#fef3c7"       # light yellow
-                    elif band == "within appetite":
-                        row_bg = "#dcfce7"       # light green
-                    else:
-                        row_bg = "#ffffff"
+                    row_bg = "#ffffff"
 
                 html_table += f'<tr style="background-color: {row_bg};">'
                 for col_name, value in row.items():
@@ -2133,16 +1767,22 @@ def main():
                     elif col_name in ["Inherent Score", "Residual Score"]:
                         try:
                             score = float(value)
-                            if score <= 5:
-                                cell_style = "background-color: #166534; color: white; font-weight: 700;"
-                            elif score <= 8:
-                                cell_style = "background-color: #15803d; color: white; font-weight: 700;"
-                            elif score >= 20:
-                                cell_style = "background-color: #dc2626; color: white; font-weight: 700;"
-                            elif score >= 12:
-                                cell_style = "background-color: #f59e0b; color: white; font-weight: 700;"
-                            elif score >= 6:
-                                cell_style = "background-color: #fef3c7; color: #92400e; font-weight: 600;"
+                            if col_name == "Residual Score":
+                                # Use risk matrix colors: Low (1-4) = dark green, Medium (5-12) = orange, High (15-25) = red
+                                if score <= 4:
+                                    cell_style = "background-color: #166534; color: white; font-weight: 700;"
+                                elif score <= 12:
+                                    cell_style = "background-color: #f59e0b; color: white; font-weight: 700;"
+                                elif score >= 15:
+                                    cell_style = "background-color: #dc2626; color: white; font-weight: 700;"
+                            else:
+                                # Inherent Score: use similar but slightly different if needed
+                                if score >= 20:
+                                    cell_style = "background-color: #dc2626; color: white; font-weight: 700;"
+                                elif score >= 12:
+                                    cell_style = "background-color: #f59e0b; color: white; font-weight: 700;"
+                                elif score >= 6:
+                                    cell_style = "background-color: #fef3c7; color: #92400e; font-weight: 600;"
                         except:
                             pass
                     elif col_name == "Mitigation %":
