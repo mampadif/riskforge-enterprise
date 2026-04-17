@@ -1696,13 +1696,22 @@ def render_sidebar():
                         except Exception as e:
                             st.error(f"Stripe error: {e}")
             st.markdown("---")
-            code = st.text_input("Unlock code", type="password")
-            if code == PRO_UNLOCK_CODE:
-                st.session_state.tier = "professional"
-                st.rerun()
-            if code == ENT_UNLOCK_CODE:
-                st.session_state.tier = "enterprise"
-                st.rerun()
+            code = st.text_input("Unlock code", type="password", placeholder="Enter code")
+            col_apply, _ = st.columns([1, 2])
+            with col_apply:
+                apply_btn = st.button("Apply Code", use_container_width=True)
+            
+            if apply_btn:
+                if code == PRO_UNLOCK_CODE:
+                    st.session_state.tier = "professional"
+                    st.success("✅ Professional unlocked!")
+                    st.rerun()
+                elif code == ENT_UNLOCK_CODE:
+                    st.session_state.tier = "enterprise"
+                    st.success("✅ Enterprise unlocked!")
+                    st.rerun()
+                elif code:
+                    st.error("❌ Invalid unlock code")
         else:
             st.success(f"✅ {st.session_state.tier.upper()} active")
         st.markdown("---")
