@@ -609,14 +609,13 @@ def parse_control_effectiveness(val: Any) -> Optional[float]:
         if 0 <= num <= 1:
             return num
         elif 1 < num <= 5:
-            return (num - 1) / 4.0  # map 1-5 to 0.0-1.0
+            return (num - 1) / 4.0
     return None
 
 def infer_impact_likelihood_from_inherent(inherent: float) -> Tuple[float, float]:
     """Back-project inherent score to a plausible impact/likelihood pair."""
     if inherent <= 0:
         return 1.0, 1.0
-    # Common grid pairs for 5x5 matrix
     pairs = [
         (5, 4), (4, 5), (5, 3), (3, 5), (4, 4),
         (4, 3), (3, 4), (3, 3), (5, 2), (2, 5),
@@ -635,34 +634,23 @@ def infer_impact_likelihood_from_inherent(inherent: float) -> Tuple[float, float
 def compute_scores(
     raw_impact: Any,
     raw_likelihood: Any,
-    raw_inherent: Any,
+    raw_inherent: Any,          # ignored – we compute our own
     raw_control_effectiveness: Any,
     default_residual: int
 ) -> Tuple[int, int, float, float, float, str]:
     impact_score = parse_risk_score(raw_impact)
     likelihood_score = parse_risk_score(raw_likelihood)
-    inherent_score = parse_risk_score(raw_inherent)
 
     control_eff_factor = parse_control_effectiveness(raw_control_effectiveness)
     control_eff_text = normalize_text(raw_control_effectiveness) or "Not rated"
 
-    # Determine inherent
-    if inherent_score is not None and inherent_score > 5:
-        inherent = float(inherent_score)
-    elif impact_score is not None and likelihood_score is not None:
-        inherent = float(impact_score * likelihood_score)
-    elif impact_score is not None:
-        inherent = float(impact_score * 5)
-    elif likelihood_score is not None:
-        inherent = float(likelihood_score * 5)
-    else:
-        inherent = float(default_residual)
-
-    inherent = min(25, max(1, round(inherent)))
-
-    # Infer missing impact/likelihood
+    # If impact or likelihood missing, infer from default residual
     if impact_score is None or likelihood_score is None:
-        impact_score, likelihood_score = infer_impact_likelihood_from_inherent(inherent)
+        impact_score, likelihood_score = infer_impact_likelihood_from_inherent(float(default_residual))
+
+    # ALWAYS compute inherent as impact × likelihood
+    inherent = impact_score * likelihood_score
+    inherent = min(25, max(1, round(inherent)))
 
     # Residual = Inherent × (1 − Control Effectiveness)
     if control_eff_factor is not None:
@@ -839,7 +827,7 @@ def parse_structured_risk_register(
     default_residual: int
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     debug_info: Dict[str, Any] = {
-        "parser": "intelligent_structured_v12",
+        "parser": "intelligent_structured_v13",
         "candidate_sheets": [],
         "selected_sheets": [],
         "error": None,
@@ -937,6 +925,10 @@ def simple_fallback_parser(
                             ]
                             if not any(ind in text.lower() for ind in metadata_indicators):
                                 division_name, division_source, division_conf = get_division_for_risk(file_name, sheet_name, None)
+                                # Default impact/likelihood = 3
+                                impact = 3.0
+                                likelihood = 3.0
+                                inherent = impact * likelihood
                                 row = {
                                     "division": division_name,
                                     "division_source": division_source,
@@ -947,10 +939,10 @@ def simple_fallback_parser(
                                     "risk_statement": text[:500],
                                     "cause": "",
                                     "category": "Uncategorised",
-                                    "inherent_score": default_residual,
-                                    "residual_score": default_residual,
-                                    "impact_score": 3.0,
-                                    "likelihood_score": 3.0,
+                                    "inherent_score": inherent,
+                                    "residual_score": inherent,  # no control info
+                                    "impact_score": impact,
+                                    "likelihood_score": likelihood,
                                     "owner": "Not assigned",
                                     "status": "Active",
                                     "due_date": None,
@@ -1012,7 +1004,6 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
     if raw_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Helper to safely get column as list
     def safe_col(col_name, default_val=None):
         if col_name in raw_df.columns:
             return raw_df[col_name].fillna(default_val).tolist()
@@ -1115,7 +1106,7 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         cat_counts = pd.Series(cluster_categories).value_counts()
         primary_category = cat_counts.index[0] if not cat_counts.empty else "Uncategorised"
         max_residual = max(cluster_residuals) if cluster_residuals else 0
-        avg_inherent = round(sum(cluster_inherents) / len(cluster_inherents), 1) if cluster_inherents else 0
+        max_inherent = max(cluster_inherents) if cluster_inherents else 0
         avg_impact = round(sum(cluster_impacts) / len(cluster_impacts), 1) if cluster_impacts else 0
         avg_likelihood = round(sum(cluster_likelihoods) / len(cluster_likelihoods), 1) if cluster_likelihoods else 0
         all_owners = ", ".join(sorted(set(o for o in cluster_owners if o.lower() != "not assigned"))) or "Not assigned"
@@ -1130,7 +1121,7 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         worst_control_text = cluster_control_eff_text[cluster_control_eff_factor.index(worst_control_eff)] if worst_control_eff in cluster_control_eff_factor else "Not rated"
 
         # Mitigation strength
-        mitigation_strength = round((avg_inherent - max_residual) / avg_inherent * 100, 1) if avg_inherent > 0 else 0.0
+        mitigation_strength = round((max_inherent - max_residual) / max_inherent * 100, 1) if max_inherent > 0 else 0.0
 
         # Treatment aggregation
         strategy_counts = pd.Series([s for s in cluster_strategies if s]).value_counts()
@@ -1159,7 +1150,7 @@ def build_enterprise_register(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
             "all_contributing_divisions": all_divisions_str,
             "primary_category": primary_category,
             "all_categories": ", ".join(sorted(unique_cats)),
-            "inherent_score": avg_inherent,
+            "inherent_score": max_inherent,
             "residual_score": max_residual,
             "impact_pre": avg_impact,
             "likelihood_pre": avg_likelihood,
@@ -1983,7 +1974,6 @@ def main():
         with tab2:
             st.subheader("Enterprise Risk Register")
 
-            # Mapping dictionaries for impact/likelihood text
             IMPACT_MAP = {5: "Critical", 4: "Major", 3: "Moderate", 2: "Significant", 1: "Minor"}
             LIKELIHOOD_MAP = {5: "Almost Certain", 4: "Likely", 3: "Moderate", 2: "Unlikely", 1: "Rare"}
             INHERENT_LEVEL_MAP = {
@@ -1999,14 +1989,12 @@ def main():
                         return label
                 return "Unknown"
 
-            # Create display dataframe with additional columns
             display_df = enterprise_df.copy()
 
             display_df["impact_text"] = display_df["impact_pre"].apply(lambda x: IMPACT_MAP.get(int(round(x)), "Unknown") if pd.notna(x) else "Unknown")
             display_df["likelihood_text"] = display_df["likelihood_pre"].apply(lambda x: LIKELIHOOD_MAP.get(int(round(x)), "Unknown") if pd.notna(x) else "Unknown")
             display_df["inherent_text"] = display_df["inherent_score"].apply(get_inherent_level)
 
-            # Select and order columns for display
             display_cols = [
                 "enterprise_risk_id",
                 "risk_name",
